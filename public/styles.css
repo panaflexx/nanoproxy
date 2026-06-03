@@ -1,0 +1,737 @@
+/* styles.css */
+
+body {
+    font-family: system-ui, sans-serif;
+    margin: 0;
+    padding: 0;
+    background: #f0f2f5;
+}
+
+.topbar {
+    background: #fff;
+    border-bottom: 1px solid #ddd;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+}
+.topbar-inner {
+    max-width: 600px;
+    margin: 0 auto;
+    padding: 12px 16px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+.brand {
+    font-weight: 700;
+    font-size: 1.25rem;
+    color: #111;
+}
+.user-area {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 0.95rem;
+}
+.logout-btn {
+    background: #f1f3f5;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-size: 0.9rem;
+    cursor: pointer;
+}
+.logout-btn:hover {
+    background: #e9ecef;
+}
+#feed-container {
+    max-width: 600px;
+    margin: 20px auto;
+    height: 90vh;
+    overflow-y: auto;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    background: #fff;
+}
+.post {
+    border-bottom: 1px solid #eee;
+    padding: 12px;
+}
+.post-main {
+    background: #f8f9fa;
+    border-radius: 8px;
+    padding: 12px;
+    margin-bottom: 8px;
+}
+.post-header {
+    display: flex;
+    align-items: center;
+    margin-bottom: 12px;
+}
+.avatar {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    background: #ccc;
+    margin-right: 12px;
+}
+.username {
+    font-weight: bold;
+}
+.timestamp {
+    color: #65676b;
+    font-size: 13px;
+}
+.post-content {
+    margin-bottom: 12px;
+}
+.text-container {
+    position: relative;
+}
+.post-text {
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow: hidden;
+    transition: max-height 0.4s ease;
+}
+.post-text.truncated {
+    max-height: 200px;
+}
+.post-text.expanded {
+    max-height: 3000px; /* Large enough for any reasonable post */
+}
+.post-text.truncated::after {
+    content: "";
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    height: 80px;
+    background: linear-gradient(transparent, #f8f9fa);
+    pointer-events: none;
+    transition: opacity 0.3s ease;
+}
+.post-text.expanded::after {
+    opacity: 0;
+}
+.show-more,
+.show-less {
+    background: none;
+    border: none;
+    color: #0866ff;
+    font-weight: 600;
+    cursor: pointer;
+    padding: 8px 0;
+    font-size: 14px;
+    margin-top: 8px;
+    display: block;
+    text-align: left;
+    position: relative;
+    z-index: 1;
+}
+.show-more:hover,
+.show-less:hover {
+    text-decoration: underline;
+}
+.post-media-single {
+    width: 100%;
+    border-radius: 8px;
+    display: block;
+    margin-top: 8px;
+}
+.post-media {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 4px;
+    margin-top: 8px;
+    border-radius: 8px;
+    overflow: hidden;
+}
+.post-media img,
+.post-media video {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    aspect-ratio: 1 / 1;
+    display: block;
+}
+.post-media[data-count="1"] {
+    grid-template-columns: 1fr;
+}
+.post-media[data-count="2"] {
+    grid-template-columns: repeat(2, 1fr);
+}
+.post-media[data-count="3"] {
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: 1fr 1fr;
+}
+.post-media[data-count="3"] :first-child {
+    grid-row: 1 / 3;
+    aspect-ratio: 1 / 2;
+}
+.big-text {
+    font-size: 24px;
+    font-weight: bold;
+    padding: 40px 20px;
+    text-align: center;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    border-radius: 8px;
+    margin: 12px 0;
+}
+.actions {
+    display: flex;
+    justify-content: space-around;
+    padding: 8px 0;
+    border-top: 1px solid #ddd;
+}
+.action-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: none;
+    border: none;
+    font-size: 15px;
+    color: #65676b;
+    cursor: pointer;
+    padding: 8px 16px;
+    border-radius: 6px;
+}
+.action-btn:hover {
+    background: #e9ecef;
+}
+.comments {
+    margin-top: 12px;
+}
+.comment {
+    margin-bottom: 8px;
+    font-size: 14px;
+}
+.comment-author {
+    font-weight: bold;
+    margin-right: 6px;
+}
+
+.more-comments-hint {
+    font-style: italic;
+    color: #888;
+    font-size: 13px;
+    text-align: center;
+    margin-top: 4px;
+}
+
+.loading {
+    text-align: center;
+    padding: 20px;
+    color: #65676b;
+}
+.end-of-feed {
+    text-align: center;
+    padding: 24px;
+    color: #65676b;
+    font-size: 0.95rem;
+}
+
+/* Comment Modal */
+#comment-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.modal-overlay {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+}
+.modal-content {
+    position: relative;
+    background: #fff;
+    width: 100%;
+    max-width: 520px;
+    max-height: 85vh;
+    border-radius: 12px;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.25);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+/* Allow Add Post modal to grow with media previews while keeping footer visible */
+#add-post-modal .add-post-content {
+    min-height: 520px;
+}
+#add-post-modal .add-post-body {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    min-height: 0;
+}
+.modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 20px;
+    border-bottom: 1px solid #eee;
+}
+.modal-header h3 {
+    margin: 0;
+    font-size: 1.1rem;
+}
+.modal-close {
+    background: none;
+    border: none;
+    font-size: 1.6rem;
+    line-height: 1;
+    cursor: pointer;
+    color: #666;
+}
+.modal-post-preview {
+    padding: 16px 20px;
+    background: #f8f9fa;
+    border-bottom: 1px solid #eee;
+    flex: 0 0 auto;
+    max-height: 40vh;
+    overflow: auto;
+}
+.modal-post-content {
+    margin-top: 8px;
+}
+.modal-comments {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px 20px;
+    min-height: 120px;
+}
+.modal-comment {
+    padding: 8px 0;
+    border-bottom: 1px solid #f0f0f0;
+}
+.modal-comment:last-child {
+    border-bottom: none;
+}
+.modal-add-comment {
+    padding: 16px 20px;
+    border-top: 1px solid #eee;
+    display: flex;
+    gap: 8px;
+}
+.modal-add-comment textarea {
+    flex: 1;
+    padding: 10px;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    font-size: 0.95rem;
+    resize: vertical;
+    min-height: 42px;
+}
+.add-btn {
+    background: #1877f2;
+    color: white;
+    border: none;
+    border-radius: 8px;
+    padding: 0 20px;
+    font-weight: 600;
+    cursor: pointer;
+}
+.add-btn:hover {
+    background: #166fe0;
+}
+.no-comments {
+    color: #666;
+    font-style: italic;
+    padding: 20px 0;
+}
+
+/* Refresh overlay & button */
+.feed-refresh-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 20;
+    background: rgba(60, 60, 60, 0.85);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    transition: opacity 0.25s ease;
+}
+.feed-refresh-overlay.fade-in {
+    opacity: 1;
+}
+
+.spinner {
+    width: 36px;
+    height: 36px;
+    border: 4px solid #ccc;
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.refresh-btn {
+    display: block;
+    margin: 12px auto 24px;
+    padding: 8px 24px;
+    background: #1877f2;
+    color: white;
+    border: none;
+    border-radius: 6px;
+    font-size: 0.95rem;
+    font-weight: 500;
+    cursor: pointer;
+}
+.refresh-btn:hover {
+    background: #166fe0;
+}
+
+/* Add Post modal & form */
+#add-post-modal,
+#delete-post-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.add-post-content {
+    max-width: 540px;
+}
+
+.add-post-body {
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+}
+
+.post-type-selector {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 16px;
+}
+
+.type-btn {
+    flex: 1;
+    padding: 8px 12px;
+    border: 1px solid #ddd;
+    background: #fff;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.9rem;
+}
+
+.type-btn.active {
+    background: #1877f2;
+    color: white;
+    border-color: #1877f2;
+}
+
+.add-post-body textarea {
+    flex: 1 1 auto;
+    width: 100%;
+    max-width: 100%;
+    box-sizing: border-box;
+    padding: 12px;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    font-size: 1rem;
+    resize: vertical;
+    min-height: 200px;
+}
+
+.big-quote-textarea {
+    font-size: 20px;
+    font-weight: 600;
+    text-align: center;
+    border-color: #667eea;
+    padding: 24px 16px;
+    min-height: 120px;
+}
+
+/* 6 Big Quote preview styles (live in composer) */
+.quote-preview-purple {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+}
+.quote-preview-sunset {
+    background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+    color: white;
+}
+.quote-preview-ocean {
+    background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+    color: white;
+}
+.quote-preview-forest {
+    background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);
+    color: #1a3c34;
+}
+.quote-preview-elegant {
+    background: #1f2937;
+    color: #f3e8d8;
+    font-family: Georgia, serif;
+}
+.quote-preview-birthday {
+    background: linear-gradient(135deg, #ff9a9e 0%, #fad0c4 50%, #a1c4fd 100%);
+    color: #3f2a1d;
+    font-weight: 700;
+    text-shadow: 0 1px 2px rgba(255, 255, 255, 0.6);
+}
+
+.media-section {
+    margin-top: 16px;
+}
+
+.media-preview {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.media-thumb-wrapper {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.media-remove-btn {
+    margin-top: 4px;
+    background: #ff4d4f;
+    color: white;
+    border: none;
+    border-radius: 50%;
+    width: 22px;
+    height: 22px;
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.media-remove-btn:hover {
+    background: #d9363e;
+}
+
+.media-thumb {
+    max-width: 120px;
+    max-height: 120px;
+    border-radius: 6px;
+    object-fit: cover;
+}
+
+.tag-friends {
+    margin-top: 16px;
+}
+
+.tag-friends label {
+    display: block;
+    font-size: 0.9rem;
+    color: #555;
+    margin-bottom: 4px;
+}
+
+.tag-friends input {
+    width: 100%;
+    padding: 10px;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+}
+
+.friends-hint {
+    font-size: 0.75rem;
+    color: #888;
+    margin-top: 4px;
+}
+
+/* Quote style chooser buttons */
+.quote-style-chooser {
+    margin: 12px 0 4px;
+    height: 58px; /* always reserve exact space for the style row */
+    overflow: hidden;
+}
+.quote-style-label {
+    font-size: 0.85rem;
+    color: #555;
+    margin-bottom: 6px;
+}
+.quote-style-buttons {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+.quote-style-btn {
+    padding: 6px 12px;
+    border: 1px solid #ddd;
+    background: #fff;
+    border-radius: 16px;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+.quote-style-btn.active {
+    color: #fff;
+    border-color: #1877f2;
+    background: #1877f2;
+}
+
+.modal-footer {
+    padding: 16px 20px;
+    border-top: 1px solid #eee;
+    display: flex;
+    gap: 12px;
+    justify-content: flex-end;
+}
+
+.feed-header {
+    max-width: 600px;
+    margin: 12px auto 0;
+    text-align: center;
+}
+
+#add-post-btn {
+    font-size: 1.15rem;
+    padding: 12px 30px;
+}
+
+/* Custom centered white spinner for PhotoSwipe */
+.pswp__preloader {
+    /* center with margins so the spin animation's transform is not overridden */
+    position: absolute !important;
+    top: 50% !important;
+    left: 50% !important;
+    margin: -24px 0 0 -24px;
+    width: 48px !important;
+    height: 48px !important;
+    border: 4px solid #fff !important;
+    border-top-color: transparent !important;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    box-sizing: border-box;
+    z-index: 2000;
+    /* hidden by default; shown only while loading */
+    opacity: 0;
+}
+
+.pswp__preloader--active {
+    opacity: 1 !important;
+}
+
+/* Hide PhotoSwipe's default nested preloader elements so our ring shows */
+.pswp__preloader__icn,
+.pswp__preloader__cut,
+.pswp__preloader__donut,
+.pswp__preloader .pswp__icn {
+    display: none !important;
+}
+
+/* Hide single-image arrows + counter */
+.pswp__counter {
+    display: none !important;
+}
+.pswp--one-slide .pswp__button--arrow--left,
+.pswp--one-slide .pswp__button--arrow--right {
+    display: none !important;
+}
+
+/* Post ⋯ menu */
+.post-header {
+    position: relative;
+    display: flex;
+    align-items: flex-start;
+}
+.post-menu {
+    margin-left: auto;
+    position: relative;
+}
+.post-menu-btn {
+    background: none;
+    border: none;
+    font-size: 1.4rem;
+    line-height: 1;
+    padding: 4px 8px;
+    cursor: pointer;
+    color: #666;
+    border-radius: 4px;
+}
+.post-menu-btn:hover {
+    background: #f0f0f0;
+}
+.post-menu-dropdown {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    background: white;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+    min-width: 120px;
+    z-index: 10;
+    display: none;
+}
+.post-menu-dropdown.show {
+    display: block;
+}
+.post-menu-item {
+    display: block;
+    width: 100%;
+    padding: 10px 16px;
+    text-align: left;
+    background: none;
+    border: none;
+    font-size: 0.95rem;
+    cursor: pointer;
+}
+.post-menu-item.delete {
+    color: #e0245e;
+}
+.post-menu-item.delete:hover {
+    background: #fff0f3;
+}
+
+/* Delete modal */
+.delete-modal .modal-actions {
+    padding: 16px 20px;
+    border-top: 1px solid #eee;
+    display: flex;
+    justify-content: flex-end;
+}
+.btn-danger {
+    background: #e0245e;
+    color: white;
+    border: none;
+    padding: 10px 24px;
+    border-radius: 20px;
+    font-weight: 600;
+    cursor: pointer;
+}
+.btn-danger:hover {
+    background: #c41e50;
+}
+.delete-preview {
+    padding: 16px 20px;
+    background: #f8f9fa;
+    max-height: 280px;
+    overflow: auto;
+}
+.post-preview {
+    pointer-events: none;
+    opacity: 0.9;
+}
+.post-content-preview {
+    margin-top: 8px;
+}

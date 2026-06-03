@@ -1,0 +1,27 @@
+{
+  "listen": [{ "name": "dns", "uri": "udp://127.0.0.1:19953" }],
+  "dns_ttl": 300,
+  "dns": {
+    "single.test":    { "A": "10.0.0.1" },
+    "dual.test":      { "A": "10.0.0.2", "AAAA": "fd00::2" },
+    "multi.test":     { "A": ["10.0.0.10", "10.0.0.11"] },
+    "alias.test":     { "CNAME": "single.test" },
+    "mail.test": {
+      "MX": [
+        { "priority": 10, "host": "mx1.mail.test" },
+        { "priority": 20, "host": "mx2.mail.test" }
+      ]
+    },
+    "info.test": {
+      "TXT": ["v=spf1 ~all", "hello=world"],
+      "NS":  ["ns1.info.test", "ns2.info.test"]
+    },
+    "_http._tcp.web.test": {
+      "SRV": { "priority": 0, "weight": 100, "port": 8080, "target": "single.test" }
+    },
+    "ttl60.test":     { "A": "10.0.0.99", "TTL": 60 }
+  },
+  "dispatch": [
+    { "listener": "dns", "handler": "dns" }
+  ]
+}

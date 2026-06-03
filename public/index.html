@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Infinite Scroll Feed • Nanoserver</title>
+        <!-- PhotoSwipe 5 (CDN) for nice media gallery -->
+        <link
+            rel="stylesheet"
+            href="https://unpkg.com/photoswipe@5/dist/photoswipe.css"
+        />
+        <link rel="stylesheet" href="styles.css" />
+    </head>
+    <body>
+        <header class="topbar">
+            <div class="topbar-inner">
+                <div class="brand">Nanoserver</div>
+                <div class="user-area">
+                    <span id="username-display"></span>
+                    <button id="logout-btn" class="logout-btn">Log out</button>
+                </div>
+            </div>
+        </header>
+        <div class="feed-header">
+            <button id="add-post-btn" class="add-btn">+ Add New Post</button>
+        </div>
+        <div id="feed-container"></div>
+
+        <!-- PhotoSwipe UMD (CDN) - must load before our script.js -->
+        <script src="https://unpkg.com/photoswipe@5/dist/umd/photoswipe.umd.min.js"></script>
+        <script src="https://unpkg.com/photoswipe@5/dist/umd/photoswipe-lightbox.umd.min.js"></script>
+
+        <script src="comments.js"></script>
+        <script src="post.js"></script>
+        <script src="script.js"></script>
+    </body>
+</html>

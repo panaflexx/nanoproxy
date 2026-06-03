@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Login • Nanoserver</title>
+  <link rel="stylesheet" href="styles.css">
+  <style>
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      background: #f0f2f5;
+    }
+    .login-card {
+      background: white;
+      padding: 2rem;
+      border-radius: 12px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+      width: 100%;
+      max-width: 360px;
+    }
+    .login-card h1 {
+      margin: 0 0 1.5rem;
+      text-align: center;
+      font-size: 1.6rem;
+    }
+    .form-group {
+      margin-bottom: 1rem;
+    }
+    .form-group label {
+      display: block;
+      margin-bottom: 0.4rem;
+      font-weight: 500;
+    }
+    .form-group input {
+      width: 100%;
+      padding: 0.75rem;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      font-size: 1rem;
+    }
+    .login-btn {
+      width: 100%;
+      padding: 0.85rem;
+      background: #1877f2;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 1.05rem;
+      font-weight: 600;
+      cursor: pointer;
+      margin-top: 0.5rem;
+    }
+    .login-btn:hover {
+      background: #166fe0;
+    }
+    .error {
+      color: #e74c3c;
+      font-size: 0.9rem;
+      margin-top: 0.75rem;
+      text-align: center;
+    }
+    .hint {
+      text-align: center;
+      font-size: 0.85rem;
+      color: #666;
+      margin-top: 1rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="login-card">
+    <h1>Sign in</h1>
+    <form id="login-form">
+      <div class="form-group">
+        <label for="username">Username</label>
+        <input type="text" id="username" required autocomplete="username">
+      </div>
+      <div class="form-group">
+        <label for="password">Password</label>
+        <input type="password" id="password" required autocomplete="current-password">
+      </div>
+      <button type="submit" class="login-btn">Log in</button>
+      <div id="error" class="error" style="display:none;"></div>
+    </form>
+    <div class="hint">
+      Demo accounts: <strong>alice</strong> / <strong>demo</strong><br>
+      or register new users via the API
+    </div>
+  </div>
+
+  <script>
+    const form = document.getElementById('login-form');
+    const errorEl = document.getElementById('error');
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      errorEl.style.display = 'none';
+
+      const username = document.getElementById('username').value.trim();
+      const password = document.getElementById('password').value;
+
+      try {
+        const res = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ username, password }),
+          credentials: 'include'
+        });
+
+        if (res.ok) {
+          // Successful login → go back to the feed
+          window.location.href = 'index.html';
+        } else {
+          const data = await res.json();
+          errorEl.textContent = data.detail || 'Login failed';
+          errorEl.style.display = 'block';
+        }
+      } catch (err) {
+        errorEl.textContent = 'Network error. Is the backend running?';
+        errorEl.style.display = 'block';
+      }
+    });
+
+    // Optional: prefill demo credentials
+    document.getElementById('username').value = 'alice';
+    document.getElementById('password').value = 'demo';
+  </script>
+</body>
+</html>

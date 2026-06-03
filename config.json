@@ -1,0 +1,189 @@
+{
+  // npserver config — static files, reverse proxy, port forwarding, protocol translation
+  "listen": [
+    { "name": "web", "uri": "http://:8080" },
+    { "name": "tls", "uri": "https://:8443" },
+    { "name": "dns-in", "uri": "udp://127.0.0.1:5353" },
+    { "name": "db-local", "uri": "tcp://:3307" },
+    { "name": "sidecar", "uri": "tcp://:9000" },
+    { "name": "gameproxy", "uri": "udp://:27015" },
+    "unix:///tmp/app.sock"
+  ],
+  "tls": {
+	// Use the make_test_cert.sh script to make these for testing
+    "cert": "testsite.crt",
+    "key": "testsite.key"
+  },
+  "backlog": 2048,
+
+  // Connection timeouts (seconds) — tune for your workload
+  // All values optional; built-in defaults shown here
+  "timeouts": {
+    "header": 10, // max seconds to receive complete request headers (Slowloris defense)
+    "body": 30, // max seconds between body data chunks
+    "idle": 60, // keep-alive idle timeout before closing
+    "max_connections_per_ip": 500 // per-IP connection cap (basic DoS defense, 0 = unlimited)
+  },
+
+  // Per-subsystem log levels: trace, debug, info, warn (default), error, fatal, off
+  // format: "pretty" (default, colored) or "json" (structured, one JSON object per line)
+  // Omit this section entirely for quiet defaults (warn-only).
+  "logging": {
+    "format": "pretty",
+    "access_log": "stdout", // "stdout" (default), "stderr", "off", or a file path
+    "config": "info",
+    "server": "info",
+    "proxy": "info"
+  },
+
+  "dns_ttl": 300,
+
+  // Built-in DNS resolver (serves on any udp:// listener with handler "dns")
+  "dns": {
+    "redis.local": { "A": "192.168.11.2", "AAAA": "fd00::2" },
+    "postgres.local": { "A": "192.168.11.3" },
+    "web.local": { "A": ["10.0.0.10", "10.0.0.11"], "AAAA": "fd00::10" },
+    "app.local": { "CNAME": "web.local" },
+    "cache.local": { "A": "192.168.11.4", "TTL": 60 },
+    "example.com": {
+      "A": "93.184.216.34",
+      "MX": [
+        { "priority": 10, "host": "mx1.example.com" },
+        { "priority": 20, "host": "mx2.example.com" }
+      ],
+      "TXT": [
+        "v=spf1 include:example.com ~all",
+        "google-site-verification=abc123"
+      ],
+      "NS": ["ns1.example.com", "ns2.example.com"]
+    },
+    "_http._tcp.web.local": {
+      "SRV": {
+        "priority": 0,
+        "weight": 100,
+        "port": 8080,
+        "target": "web.local"
+      }
+    }
+  },
+
+  // Named upstream groups for load balancing
+  // balance: "round-robin" | "ip-hash" | "conn-hash" | "least-conn" | "random"
+  "upstreams": {
+    "app_pool": {
+      "targets": [
+        "http://127.0.0.1:8001",
+        "http://127.0.0.1:8002",
+        "http://127.0.0.1:8003"
+      ],
+      "balance": "round-robin",
+      "health_check": { "path": "/healthz", "interval": 10 },
+      "proxy_timeout_seconds": 5,
+      "retry_timeout_seconds": 30
+    },
+    "ws_pool": {
+      "targets": ["http://127.0.0.1:8010", "http://127.0.0.1:8011"],
+      "balance": "least-conn",
+      "proxy_timeout_seconds": 5,
+      "retry_timeout_seconds": 30
+    }
+  },
+
+  "dispatch": [
+    // -- Static file serving --
+    {
+      "listener": "web",
+      "handler": "static",
+      "root": "./public",
+      "index": "index.html"
+    },
+    { "listener": "tls", "handler": "static", "root": "./public" },
+
+    // -- HTTP reverse proxy (sidecar → uvicorn/gunicorn ASGI) --
+    //    TLS termination on :8443, plain on :8080, both forward to app
+    {
+      "listener": "web",
+      "handler": "proxy",
+      "path": "/api/**",
+      "proxy_pass": "http://127.0.0.1:8000",
+      "strip_prefix": true,
+      "timeout": 30,
+      "headers": {
+        "X-Forwarded-Proto": "$scheme",
+        "X-Real-IP": "$client_ip"
+      }
+    },
+    {
+      "listener": "tls",
+      "handler": "proxy",
+      "path": "/api/**",
+      "proxy_pass": "http://127.0.0.1:8000",
+      "strip_prefix": true,
+      "timeout": 30
+    },
+
+    // -- Load-balanced HTTP proxy via named upstream --
+    {
+      "listener": "web",
+      "handler": "proxy",
+      "path": "/app/**",
+      "proxy_pass": "upstream://app_pool",
+      "balance": "round-robin"
+    },
+
+    // -- Raw TCP forwarding (like ssh -L 3307:dbhost:3306) --
+    //    Accept on :3307, relay bytes to remote MySQL
+    {
+      "listener": "db-local",
+      "handler": "forward",
+      "forward_to": "tcp://dbserver.internal:3306",
+      "timeout": 300,
+      "max_connections": 20,
+      "buffer_size": 65536
+    },
+
+    // -- UDP → UDP forwarding (DNS relay / split-horizon) --
+    {
+      "listener": "dns-in",
+      "handler": "forward",
+      "forward_to": "udp://8.8.8.8:53"
+    },
+
+    // -- TCP → UDP protocol translation --
+    //    Accept TCP on :9000, forward as UDP to StatsD
+    {
+      "listener": "sidecar",
+      "handler": "forward",
+      "forward_to": "udp://statsd.internal:8125",
+      "mode": "datagram"
+    },
+
+    // -- UDP → TCP protocol translation --
+    //    Accept UDP game traffic, forward over TCP to game server
+    {
+      "listener": "gameproxy",
+      "handler": "forward",
+      "forward_to": "tcp://gameserver.internal:27015",
+      "mode": "stream"
+    },
+
+    // -- Unix socket forwarding (container sidecar) --
+    //    Forward from TCP to a local unix socket (e.g. PHP-FPM)
+    {
+      "listener": "sidecar",
+      "handler": "forward",
+      "forward_to": "unix:///var/run/php-fpm.sock"
+    },
+
+    // -- Static media directory --
+    {
+      "listener": "web",
+      "handler": "static",
+      "path": "/usermedia/**",
+      "root": "./backend/usermedia"
+    },
+
+    // -- DNS handler --
+    { "listener": "dns-in", "handler": "dns" }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "listen": [{ "name": "web", "uri": "http://:19903" }],
+  "upstreams": {
+    "test_pool": {
+      "targets": ["http://127.0.0.1:19990", "http://127.0.0.1:19991"],
+      "balance": "round-robin",
+      "proxy_timeout_seconds": 2,
+      "retry_timeout_seconds": 10
+    }
+  },
+  "dispatch": [
+    { "listener": "web", "handler": "proxy", "path": "/app/**",
+      "proxy_pass": "upstream://test_pool" }
+  ]
+}
