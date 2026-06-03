@@ -1134,6 +1134,28 @@ static inline struct socket_info create_socket_and_listen(const char *uri, int b
     StringBuf sb;
     stringbuf_init_str(&sb, uri, strlen(uri), 0);
 
+    /* ── Fast path: unix/local sockets ─────────────────────────────────────
+     * These do not follow host:port format and may contain colons/slashes.
+     * Must be handled before any sscanf attempts. */
+    if (strncmp(uri, "unix://", 7) == 0 ||
+        strncmp(uri, "local://", 8) == 0 ||
+        strncmp(uri, "unixgram://", 11) == 0) {
+
+        is_local = true;
+        if (strncmp(uri, "unixgram://", 11) == 0) {
+            is_datagram_local = true;
+        }
+
+        const char *after = strstr(uri, "://");
+        if (after) {
+            after += 3;
+            strncpy(path, after, sizeof(path) - 1);
+            path[sizeof(path) - 1] = '\0';
+        }
+        stringbuf_free(&sb);
+        goto do_local;
+    }
+
     /* Try the modern scan first (handles IPv6 literals cleanly) */
     int n = stringbuf_sscanf(&sb, "%15[^:]://[%255[^]]]:%5[0-9]", scheme, host, portstr);
     if (n == 3) {
@@ -1147,8 +1169,8 @@ static inline struct socket_info create_socket_and_listen(const char *uri, int b
             host[0] = '\0';
             if (n != 2) {
                 stringbuf_free(&sb);
-                /* fall through to legacy unix/local handling below */
-                goto legacy;
+                /* fall through to legacy unix/local handling */
+                goto do_local;
             }
         }
     }
@@ -1189,30 +1211,26 @@ static inline struct socket_info create_socket_and_listen(const char *uri, int b
         return si;
     }
 
-legacy:
-    /* minimal legacy path for unix sockets (already classified above) */
+do_local:
+    /* ── Unix / Local socket handling ───────────────────────────────────── */
     if (is_local) {
-        const char *after = strstr(uri, "://");
-        if (after) {
-            after += 3;
-            strncpy(path, after, sizeof(path) - 1);
-            path[sizeof(path) - 1] = '\0';
+        /* Extract path if not already done in fast path */
+        if (path[0] == '\0') {
+            const char *after = strstr(uri, "://");
+            if (after) {
+                after += 3;
+                strncpy(path, after, sizeof(path) - 1);
+                path[sizeof(path) - 1] = '\0';
+            }
         }
-    }
 
-    int socktype = is_datagram_local ? SOCK_DGRAM : SOCK_STREAM;
-    si.is_datagram = is_datagram_local;
-    si.is_tls = is_ssl_local;
-    si.is_http = is_http_local;
-    si.num_fds = 0;
-
-    if (is_local) {
         struct sockaddr_un addr;
         memset(&addr, 0, sizeof(addr));
         addr.sun_family = AF_UNIX;
         strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
         addr.sun_path[sizeof(addr.sun_path) - 1] = '\0';
-        /* Ensure parent directory exists (create if needed) */
+
+        /* Ensure parent directory exists */
         {
             char dir[256];
             strncpy(dir, path, sizeof(dir));
@@ -1222,19 +1240,24 @@ legacy:
                 mkdir(dir, 0755); /* ignore error if exists */
             }
         }
-        unlink(path);
+
+        unlink(path);   /* remove old socket if it exists */
+
+        int socktype = is_datagram_local ? SOCK_DGRAM : SOCK_STREAM;
         int local_s = socket(AF_UNIX, socktype, 0);
         if (local_s < 0) {
             log_sys_error(NULL, "socket unix", errno);
             LOG_ERROR(SERVER, "failed to create unix socket %s: %s", uri, strerror(errno));
             return si;
         }
-        if (bind(local_s, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+
+        if (bind(local_s, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
             log_sys_error(NULL, "bind unix", errno);
             LOG_ERROR(SERVER, "bind unix failed for %s: %s", uri, strerror(errno));
             close(local_s);
             return si;
         }
+
         if (!is_datagram_local) {
             if (listen(local_s, backlog) < 0) {
                 log_sys_error(NULL, "listen unix", errno);
@@ -1243,121 +1266,124 @@ legacy:
                 return si;
             }
         }
+
         if (fcntl(local_s, F_SETFL, O_NONBLOCK) < 0) {
             log_sys_error(NULL, "fcntl listen", errno);
             close(local_s);
             return si;
         }
-        si.fds[si.num_fds++] = local_s;
-    } else {
-        char *host_ptr = NULL;
-		if (strlen(host) > 0) {
-            host_ptr = host;
-            // Strip brackets if present (for IPv6 literals like [::])
-            if (host[0] == '[' && host[strlen(host)-1] == ']') {
-                host[strlen(host)-1] = '\0';  // Temporarily null-terminate
-                host_ptr = host + 1;         // Point inside brackets
-            }
-        }
 
-        struct addrinfo hints = {0};
-        hints.ai_flags = AI_PASSIVE;
-        hints.ai_family = PF_UNSPEC;
-        hints.ai_socktype = socktype;
-        struct addrinfo *res = NULL;
-        int e = getaddrinfo(host_ptr, portstr, &hints, &res);
-        if (e != 0) {
-            LOG_ERROR(SERVER, "getaddrinfo: %s", gai_strerror(e));
-            return si;
-        }
-        int ipv4_fd = -1;
-        int ipv6_fd = -1;
-        LOG_INFO(SERVER, "listen: host='%s' port='%s' explicit_host=%d", host, portstr, explicit_host);
-        for (struct addrinfo *p = res; p != NULL; p = p->ai_next) {
-            LOG_DEBUG(SERVER, "addrinfo family=%d (AF_INET=%d AF_INET6=%d)", p->ai_family, AF_INET, AF_INET6);
-            if (p->ai_family == AF_INET && ipv4_fd < 0) {
-                int s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-                if (s < 0) {
-                    log_sys_error(NULL, "socket ip", errno);
-                    continue;
-                }
-                int opt = 1;
-                setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-                if (bind(s, p->ai_addr, p->ai_addrlen) < 0) {
-                    log_sys_error(NULL, "bind ip", errno);
-                    if (!explicit_host) {
-                        /* transient dual-stack collision; try next addrinfo */
-                        close(s);
-                        continue;
-                    }
-                    /* explicit host requested - real failure */
-                    LOG_ERROR(SERVER, "bind failed for %s: %s", uri, strerror(errno));
-                    close(s);
-                    continue;
-                }
-                if (!is_datagram_local) {
-                    if (listen(s, backlog) < 0) {
-                        log_sys_error(NULL, "listen ip", errno);
-                        close(s);
-                        continue;
-                    }
-                }
-                if (fcntl(s, F_SETFL, O_NONBLOCK) < 0) {
-                    log_sys_error(NULL, "fcntl listen", errno);
-                    close(s);
-                    continue;
-                }
-                ipv4_fd = s;
-            } else if (p->ai_family == AF_INET6 && ipv6_fd < 0) {
-                int s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-                if (s < 0) {
-                    log_sys_error(NULL, "socket ip", errno);
-                    continue;
-                }
-                int opt = 1;
-                setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-                if (bind(s, p->ai_addr, p->ai_addrlen) < 0) {
-                    log_sys_error(NULL, "bind ip", errno);
-                    if (!explicit_host) {
-                        /* transient dual-stack collision; try next addrinfo */
-                        close(s);
-                        continue;
-                    }
-                    /* explicit host requested - real failure */
-                    LOG_ERROR(SERVER, "bind failed for %s: %s", uri, strerror(errno));
-                    close(s);
-                    continue;
-                }
-                if (!is_datagram_local) {
-                    if (listen(s, backlog) < 0) {
-                        log_sys_error(NULL, "listen ip", errno);
-                        close(s);
-                        continue;
-                    }
-                }
-                if (fcntl(s, F_SETFL, O_NONBLOCK) < 0) {
-                    log_sys_error(NULL, "fcntl listen", errno);
-                    close(s);
-                    continue;
-                }
-                ipv6_fd = s;
-            }
-            /* For empty-host (dual-stack intent) stop after first success */
-            if (!explicit_host && strlen(host) == 0 && (ipv4_fd >= 0 || ipv6_fd >= 0)) {
-                break;
-            }
-        }
-        freeaddrinfo(res);
-        if (ipv4_fd >= 0) {
-            si.fds[si.num_fds++] = ipv4_fd;
-        }
-        if (ipv6_fd >= 0) {
-            si.fds[si.num_fds++] = ipv6_fd;
-        }
-        if (si.num_fds == 0) {
-            return si;
+        si.is_datagram = is_datagram_local;
+        si.is_tls = false;
+        si.is_http = false;
+        si.fds[si.num_fds++] = local_s;
+
+        LOG_INFO(SERVER, "unix socket listening: %s", uri);
+        return si;
+    } 
+		
+
+    /* ── TCP/UDP/IP socket handling ─────────────────────────────────────── */
+    int socktype = is_datagram_local ? SOCK_DGRAM : SOCK_STREAM;
+    si.is_datagram = is_datagram_local;
+    si.is_tls = is_ssl_local;
+    si.is_http = is_http_local;
+    si.num_fds = 0;
+
+    char *host_ptr = NULL;
+    if (strlen(host) > 0) {
+        host_ptr = host;
+        /* Strip brackets if present (for IPv6 literals like [::1]) */
+        if (host[0] == '[' && host[strlen(host)-1] == ']') {
+            host[strlen(host)-1] = '\0';
+            host_ptr = host + 1;
         }
     }
+
+    struct addrinfo hints = {0};
+    hints.ai_flags = AI_PASSIVE;
+    hints.ai_family = PF_UNSPEC;
+    hints.ai_socktype = socktype;
+
+    struct addrinfo *res = NULL;
+    int e = getaddrinfo(host_ptr, portstr, &hints, &res);
+    if (e != 0) {
+        LOG_ERROR(SERVER, "getaddrinfo: %s (host='%s' port='%s')", gai_strerror(e), host, portstr);
+        return si;
+    }
+
+    int ipv4_fd = -1;
+    int ipv6_fd = -1;
+
+    LOG_INFO(SERVER, "listen: host='%s' port='%s' explicit_host=%d", host, portstr, explicit_host);
+
+    for (struct addrinfo *p = res; p != NULL; p = p->ai_next) {
+        if (p->ai_family == AF_INET && ipv4_fd < 0) {
+            int s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+            if (s < 0) continue;
+
+            int opt = 1;
+            setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+            if (bind(s, p->ai_addr, p->ai_addrlen) < 0) {
+                if (!explicit_host) {
+                    close(s);
+                    continue;
+                }
+                LOG_ERROR(SERVER, "bind failed for %s: %s", uri, strerror(errno));
+                close(s);
+                continue;
+            }
+
+            if (!is_datagram_local) {
+                if (listen(s, backlog) < 0) {
+                    close(s);
+                    continue;
+                }
+            }
+
+            fcntl(s, F_SETFL, O_NONBLOCK);
+            ipv4_fd = s;
+        }
+        else if (p->ai_family == AF_INET6 && ipv6_fd < 0) {
+            int s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+            if (s < 0) continue;
+
+            int opt = 1;
+            setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+            if (bind(s, p->ai_addr, p->ai_addrlen) < 0) {
+                if (!explicit_host) {
+                    close(s);
+                    continue;
+                }
+                LOG_ERROR(SERVER, "bind failed for %s: %s", uri, strerror(errno));
+                close(s);
+                continue;
+            }
+
+            if (!is_datagram_local) {
+                if (listen(s, backlog) < 0) {
+                    close(s);
+                    continue;
+                }
+            }
+
+            fcntl(s, F_SETFL, O_NONBLOCK);
+            ipv6_fd = s;
+        }
+
+        /* For empty-host (dual-stack) stop after first success */
+        if (!explicit_host && strlen(host) == 0 && (ipv4_fd >= 0 || ipv6_fd >= 0)) {
+            break;
+        }
+    }
+
+    freeaddrinfo(res);
+
+    if (ipv4_fd >= 0) si.fds[si.num_fds++] = ipv4_fd;
+    if (ipv6_fd >= 0) si.fds[si.num_fds++] = ipv6_fd;
+
     return si;
 }
 

@@ -49,6 +49,11 @@
 #define GZIP_MIN_SIZE 256                 /* skip gzip for tiny responses */
 #endif
 
+/* Portable NOSIGNAL flag */
+#ifndef MSG_NOSIGNAL
+#  define MSG_NOSIGNAL 0
+#endif
+
 static inline bool is_compressible_mime(const char *mime) {
     if (strncmp(mime, "text/", 5) == 0) return true;
     if (strcmp(mime, "application/javascript") == 0) return true;
@@ -603,6 +608,123 @@ static inline void http_dispatcher(http_p *p, struct http_request *req, struct c
 }
 
 static inline void resume_send(int loopfd, int fd) {
+    int idx = get_conn(fd);
+    if (idx == -1) return;
+    struct client_data *cd = &clients[idx];
+
+    if (!cd->sending_body || cd->send_remaining == 0) return;
+
+    ssize_t sent = 0;
+
+    if (cd->use_sendfile) {
+#ifdef __APPLE__
+        off_t len = cd->send_remaining;
+        int ret = sendfile(cd->send_file_fd, cd->fd, cd->send_offset, &len, NULL, 0);
+        sent = len;                    // macOS returns bytes sent in len
+        if (ret == -1) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                my_on_error(cd->loopfd, cd->fd, errno, NULL);
+                cleanup_send_state(cd);
+                conn_del(cd->fd);
+                return;
+            }
+            sent = 0;  // EAGAIN
+        }
+        // Always update offset on macOS
+        cd->send_offset += sent;
+#else
+        // Linux
+        sent = sendfile(cd->fd, cd->send_file_fd, &cd->send_offset, cd->send_remaining);
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                sent = 0;
+            } else {
+                if (cd->log_action) {
+                    default_access_log(&cd->info, cd->log_action, cd->log_status, 0, cd->bytes_written);
+                    free(cd->log_action);
+                    cd->log_action = NULL;
+                }
+                my_on_error(cd->loopfd, cd->fd, errno, NULL);
+                cleanup_send_state(cd);
+                conn_del(cd->fd);
+                return;
+            }
+        }
+#endif
+    } else {
+        // ... existing non-sendfile (gzip / buffered) code remains unchanged ...
+        if (cd->send_buf_pos == cd->send_buf_len) {
+            if (cd->send_file_fd < 0) {
+                // in-memory buffer complete
+                if (cd->log_action) {
+                    default_access_log(&cd->info, cd->log_action, cd->log_status, 0, cd->bytes_written);
+                    free(cd->log_action);
+                    cd->log_action = NULL;
+                }
+                cleanup_send_state(cd);
+                event_mod(cd->loopfd, cd->fd, EV_READ);
+                if (http_should_keep_alive(&cd->parser.req)) {
+                    http_parser_reset(&cd->parser);
+                } else {
+                    conn_del(cd->fd);
+                }
+                return;
+            }
+            ssize_t r = read(cd->send_file_fd, cd->send_buffer, CHUNK_SIZE);
+            if (r <= 0) {
+                if (cd->log_action) {
+                    default_access_log(&cd->info, cd->log_action, cd->log_status, 0, cd->bytes_written);
+                    free(cd->log_action);
+                    cd->log_action = NULL;
+                }
+                if (r < 0) my_on_error(cd->loopfd, cd->fd, errno, NULL);
+                cleanup_send_state(cd);
+                return;
+            }
+            cd->send_buf_len = r;
+            cd->send_buf_pos = 0;
+        }
+        sent = socket_write(cd->fd, cd->send_buffer + cd->send_buf_pos, cd->send_buf_len - cd->send_buf_pos);
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                sent = 0;
+            } else {
+                if (cd->log_action) {
+                    default_access_log(&cd->info, cd->log_action, cd->log_status, 0, cd->bytes_written);
+                    free(cd->log_action);
+                    cd->log_action = NULL;
+                }
+                my_on_error(cd->loopfd, cd->fd, errno, NULL);
+                cleanup_send_state(cd);
+                conn_del(cd->fd);
+                return;
+            }
+        }
+        cd->send_buf_pos += sent;
+    }
+
+    cd->bytes_written += sent;
+    cd->send_remaining -= sent;
+
+    if (cd->send_remaining == 0) {
+        if (cd->log_action) {
+            default_access_log(&cd->info, cd->log_action, cd->log_status, 0, cd->bytes_written);
+            free(cd->log_action);
+            cd->log_action = NULL;
+        }
+        cleanup_send_state(cd);
+        event_mod(cd->loopfd, cd->fd, EV_READ);
+        if (http_should_keep_alive(&cd->parser.req)) {
+            http_parser_reset(&cd->parser);
+        } else {
+            conn_del(cd->fd);
+        }
+    } else {
+        event_mod(cd->loopfd, cd->fd, EV_WRITE);
+    }
+}
+
+static inline void resume_send_orig(int loopfd, int fd) {
 	int idx = get_conn(fd);
     if (idx == -1) return;
     struct client_data *cd = &clients[idx];
@@ -1927,6 +2049,12 @@ static inline int forward_connect(struct forward_target *ft, struct sockaddr_sto
             fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
             if (fd < 0) continue;
             fcntl(fd, F_SETFL, O_NONBLOCK);
+
+#ifdef __APPLE__
+            /* macOS equivalent of MSG_NOSIGNAL */
+            int nosigpipe = 1;
+            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe));
+#endif
 
             if (out_addr) {
                 memcpy(out_addr, p->ai_addr, p->ai_addrlen);

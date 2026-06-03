@@ -7,7 +7,7 @@
     { "name": "db-local", "uri": "tcp://:3307" },
     { "name": "sidecar", "uri": "tcp://:9000" },
     { "name": "gameproxy", "uri": "udp://:27015" },
-    "unix:///tmp/app.sock"
+    { "name": "local", "uri": "unix:///tmp/app.sock" }
   ],
   "tls": {
 	// Use the make_test_cert.sh script to make these for testing
@@ -31,9 +31,9 @@
   "logging": {
     "format": "pretty",
     "access_log": "stdout", // "stdout" (default), "stderr", "off", or a file path
-    "config": "info",
-    "server": "info",
-    "proxy": "info"
+    "config": "warn",
+    "server": "warn",
+    "proxy": "warn"
   },
 
   "dns_ttl": 300,

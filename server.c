@@ -91,20 +91,20 @@ int main(int argc, char *argv[]) {
                 if (pathv && pathv->type == DICT_STRING && pathv->string_value)
                     raw_prefix = pathv->string_value;
 
-                /* Normalize common Caddy/nginx-style patterns: /api/** or /api/* -> /api/ */
+                // Normalize common Caddy/nginx-style patterns: /api/** or /api/* -> /api/
                 char prefix_buf[256];
                 const char *prefix = raw_prefix;
                 size_t rlen = strlen(raw_prefix);
                 if (rlen >= 2 && rlen < sizeof(prefix_buf)-1) {
                     if (rlen >= 3 && strcmp(raw_prefix + rlen - 3, "/**") == 0) {
-                        /* /api/** -> /api/ */
+                        // /api/** -> /api/
                         size_t plen = rlen - 2; /* drop the final '**' */
                         memcpy(prefix_buf, raw_prefix, plen);
                         prefix_buf[plen] = '\0';
                         if (plen == 0 || prefix_buf[plen-1] != '/') strcat(prefix_buf, "/");
                         prefix = prefix_buf;
                     } else if (strcmp(raw_prefix + rlen - 2, "/*") == 0) {
-                        /* /api/* -> /api/ */
+                        // /api/* -> /api/
                         size_t plen = rlen - 1; /* drop the final '*' */
                         memcpy(prefix_buf, raw_prefix, plen);
                         prefix_buf[plen] = '\0';
@@ -422,9 +422,9 @@ int main(int argc, char *argv[]) {
                     "\"msg\":\"npserver ready \u2014 %s\"}\n",
                     _tb, _ts.tv_nsec / 1000000, listen_summary);
         } else if (g_log_color) {
-            fprintf(stderr, "\n  \033[1;36m⚡ npserver\033[0m \033[2mready\033[0m — %s\n\n", listen_summary);
+            fprintf(stderr, "\033[1;36m⚡ npserver\033[0m \033[2mready\033[0m — %s\n", listen_summary);
         } else {
-            fprintf(stderr, "\n  npserver ready — %s\n\n", listen_summary);
+            fprintf(stderr, "npserver ready — %s\n\n", listen_summary);
         }
     }
 
