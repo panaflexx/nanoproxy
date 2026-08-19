@@ -395,10 +395,16 @@ static inline size_t http_build_response(const struct http_response *resp, char 
 }
 
 static inline bool http_should_keep_alive(struct http_request *req) {
-    if (req->version && strcmp(req->version, "HTTP/1.1") != 0) return false;
     ptrdiff_t conn_idx = shgeti(req->headers, "connection");
-    if (conn_idx >= 0 && strcasecmp(req->headers[conn_idx].value, "close") == 0) return false;
-    return true;
+    bool is_http_11 = req->version && strcmp(req->version, "HTTP/1.1") == 0;
+    if (is_http_11) {
+        /* HTTP/1.1 defaults to keep-alive unless the client opts out. */
+        if (conn_idx >= 0 && strcasecmp(req->headers[conn_idx].value, "close") == 0) return false;
+        return true;
+    }
+    /* HTTP/1.0 defaults to close, but an explicit "Connection: keep-alive"
+     * (e.g. ApacheBench's default request) asks to keep the socket open. */
+    return conn_idx >= 0 && strcasecmp(req->headers[conn_idx].value, "keep-alive") == 0;
 }
 
 #endif // HTTP_PARSER_H

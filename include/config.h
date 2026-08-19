@@ -94,6 +94,13 @@ typedef struct {
     const char *balance;        /* "round-robin", "random", "ip-hash" */
     bool strip_prefix;          /* remove matched path prefix before forwarding */
     int proxy_timeout;          /* connection + idle timeout */
+    /* Parsed jit fields (populated when handler == "jit") — npserver spawns
+     * a classyc HTTP app via `jitrunner` and reverse-proxies to the port it
+     * binds itself to. */
+    const char *jit_bmir;       /* path to the compiled .bmir to run */
+    int jit_port;                /* port the app binds to (proxy target) */
+    bool jit_watch;              /* pass --watch to jitrunner (hot reload) */
+    const char *jit_runner;      /* jitrunner binary name/path (default "jitrunner") */
 } DispatchEntry;
 
 /* Named upstream group for load-balanced proxying */
@@ -620,6 +627,23 @@ static int load_config(const char *path, ServerConfig *cfg, DictValue **root_out
                     DictValue *pto = dict_object_get(v, "timeout");
                     if (pto && pto->type == DICT_INT64) de->proxy_timeout = (int)pto->int64_value;
                     else if (pto && pto->type == DICT_NUMBER) de->proxy_timeout = (int)pto->number_value;
+                }
+
+                /* Parse jit-specific fields */
+                if (strcmp(h, "jit") == 0) {
+                    DictValue *bm = dict_object_get(v, "bmir");
+                    if (bm && bm->type == DICT_STRING) de->jit_bmir = bm->string_value;
+                    DictValue *pt = dict_object_get(v, "port");
+                    if (pt && pt->type == DICT_INT64) de->jit_port = (int)pt->int64_value;
+                    else if (pt && pt->type == DICT_NUMBER) de->jit_port = (int)pt->number_value;
+                    DictValue *wt = dict_object_get(v, "watch");
+                    if (wt && wt->type == DICT_BOOL && wt->bool_value) de->jit_watch = true;
+                    DictValue *jr = dict_object_get(v, "jitrunner");
+                    if (jr && jr->type == DICT_STRING) de->jit_runner = jr->string_value;
+                    DictValue *sp = dict_object_get(v, "strip_prefix");
+                    if (sp && sp->type == DICT_BOOL && sp->bool_value) de->strip_prefix = true;
+                    LOG_INFO(CONFIG, "jit: %s -> bmir=%s port=%d watch=%d",
+                            l, de->jit_bmir ? de->jit_bmir : "(null)", de->jit_port, de->jit_watch);
                 }
 
                 cfg->num_dispatch++;

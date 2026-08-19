@@ -160,8 +160,8 @@ static inline void http_add_connection_header(struct http_response *resp, bool k
     }
 }
 
-static inline struct http_response_log http_ok(http_p *p, const char *content, ssize_t content_length,
-												const char *content_type)
+static inline struct http_response_log http_ok(http_p *p, struct http_request *req, const char *content,
+												ssize_t content_length, const char *content_type)
 {
     struct http_response resp = {
         .status_code = 200,
@@ -173,7 +173,7 @@ static inline struct http_response_log http_ok(http_p *p, const char *content, s
     shputs(resp.headers, ct);
     struct http_header server = {.key = "Server", .value = "NanoServer/0.1"};
     shputs(resp.headers, server);
-	http_add_connection_header(&resp, true);
+	http_add_connection_header(&resp, http_should_keep_alive(req));
 
     char resp_buf[2048];
     size_t resp_len = http_build_response(&resp, resp_buf, sizeof(resp_buf));
@@ -213,7 +213,7 @@ static inline void default_http_handler(http_p *p, struct http_request *req, str
 							"Welcome! Received request:\nMethod: %s\nURI: %s\nVersion: %s\nBody length: %zu\n",
                             req->method ? req->method : "", req->uri ? req->uri : "",
 							req->version ? req->version : "", req->body_len);
-    http_ok(p, body, body_len, "text/plain");
+    http_ok(p, req, body, body_len, "text/plain");
 }
 
 static inline void hello_http_handler(http_p *p, struct http_request *req, struct client_data *cd) {
@@ -222,7 +222,7 @@ static inline void hello_http_handler(http_p *p, struct http_request *req, struc
 							"HELLO! Received request:\nMethod: %s\nURI: %s\nVersion: %s\nBody length: %zu\n",
                             req->method ? req->method : "", req->uri ? req->uri : "",
 							req->version ? req->version : "", req->body_len);
-    http_ok(p, body, body_len, "text/plain");
+    http_ok(p, req, body, body_len, "text/plain");
 }
 
 static inline const char *get_mime_type(const char *path) {
@@ -410,7 +410,7 @@ static inline void http_static_dir(http_p *p, struct http_request *req, struct c
             shputs(resp.headers, crh);
         }
     }
-    http_add_connection_header(&resp, true);
+    http_add_connection_header(&resp, http_should_keep_alive(req));
     char resp_buf[2048];
     size_t resp_len = http_build_response(&resp, resp_buf, sizeof(resp_buf));
     if (cr_copy) free(cr_copy);
@@ -455,7 +455,7 @@ static inline void http_static_dir(http_p *p, struct http_request *req, struct c
                     shputs(resp.headers, ce);
                     struct http_header vy  = {.key = "Vary", .value = "Accept-Encoding"};
                     shputs(resp.headers, vy);
-                    http_add_connection_header(&resp, true);
+                    http_add_connection_header(&resp, http_should_keep_alive(req));
 
                     char gz_resp_buf[2048];
                     size_t gz_resp_len = http_build_response(&resp, gz_resp_buf, sizeof(gz_resp_buf));
@@ -1162,16 +1162,15 @@ static inline void proxy_cleanup(int client_fd) {
                 free(cd->log_action);
                 cd->log_action = NULL;
             }
-            /* Reset parser and restore client for keep-alive or close.
-             * WebSocket connections are always closed (no HTTP reuse). */
-            if (ps->is_websocket) {
-                conn_del(client_fd);
-            } else if (http_should_keep_alive(&cd->parser.req)) {
-                http_parser_reset(&cd->parser);
-                event_set(g_loopfd, client_fd, EV_READ);
-            } else {
-                conn_del(client_fd);
-            }
+            /* Always close the client-facing side after a proxied response.
+             * The upstream leg is always told "Connection: close" (no
+             * upstream connection pooling — see upstream request building)
+             * and its response bytes, including that header, are relayed to
+             * the client verbatim. Deciding keep-alive independently here
+             * from the client's own request would contradict what was
+             * already sent to the client and leave a socket open that a
+             * client obeying its "Connection: close" header won't reuse. */
+            conn_del(client_fd);
         }
     }
     http_parser_destroy(&ps->parser);

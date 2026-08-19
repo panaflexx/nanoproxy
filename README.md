@@ -133,7 +133,19 @@ sh make_test_cert.sh
 
 # Use a config file
 ./npserver -config production.json
+
+# JIT-run a compiled classyc (.bmir) program — passthrough to `jitrunner`
+./npserver jitrunner /tmp/prog.bmir
+./npserver jitrunner /tmp/prog.bmir --watch
 ```
+
+`npserver jitrunner` is a thin exec passthrough: it looks for a `jitrunner`
+binary on `PATH`, then `~/.classyc/bin/jitrunner`, then
+`/usr/local/bin/jitrunner`, and execs it with the rest of the arguments.
+npserver does not link classyc or MIR — this just saves typing the full
+path when classyc (or its `jitrunner` tool) is installed. See classyc's
+own docs for `.bmir` compilation, `--watch` hot-reload, and
+`--dap`/`--dap-stdio` debugging.
 
 ---
 
@@ -248,6 +260,30 @@ npserver uses a single JSON config file. All features — listeners, static serv
 | `proxy`    | HTTP reverse proxy (+ WebSocket auto-detect)  | `proxy_pass`, `path`                        |
 | `forward`  | Raw TCP/UDP/Unix bidirectional relay          | `forward_to`, `mode`, `timeout`, `buffer_size` |
 | `dns`      | Authoritative DNS from the `dns` config block | *(none — uses the top-level `dns` section)* |
+| `jit`      | Spawn a classyc-JIT'd HTTP API via `jitrunner`, reverse-proxy to it | `bmir`, `port`, `watch`, `path` |
+
+#### `jit`: run a classyc HTTP API behind npserver
+
+`{ "handler": "jit", "bmir": "jit/app.bmir", "port": 18099, "watch": true, "path": "/jit/**" }`
+
+At startup npserver execs `jitrunner <bmir> [--watch]` as a child process
+(its own process group, so shutdown kills it cleanly) and wires the
+matched `path` to reverse-proxy to `http://127.0.0.1:<port>` — the same
+"proxy" machinery used everywhere else, just pointed at a process
+npserver itself launched. If `bmir` doesn't exist at startup the route is
+skipped with a logged error (no spawn) rather than looping — with
+`--watch`, jitrunner busy-retries a missing file, so npserver refuses to
+start that.
+
+**`port` must match what the app itself binds.** `jitrunner` currently
+runs the JIT'd program's `main()` with no `argv`, so npserver has no way
+to pass `--port=` through — set `port` to whatever the compiled program
+hardcodes (or reads from its own config/env). Build the `.bmir` with
+classyc: `classyc -I include -c -g -o jit/app.bmir jit/app.cy`. See
+classyc's `examples/http_crud` for what a real routed HTTP API looks
+like (`[[HttpGet]]` + SQLite); multi-file classyc apps currently can't
+be combined into one `.bmir` via `-c -o`, so `jit` targets need to be a
+single `.cy`/`.c` translation unit today.
 
 ### Load Balancing Algorithms
 

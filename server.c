@@ -5,6 +5,7 @@
 #include "request.h"
 #include <sys/resource.h>
 #include <unistd.h>
+#include <limits.h>
 #include "config.h"
 #include "dns.h"
 
@@ -18,9 +19,56 @@ int g_loopfd = -1;
 typedef struct { char *key; struct forward_target value; } ForwardTargetEntry;
 static ForwardTargetEntry *forward_target_map = NULL; /* listener_name -> forward_target */
 
+/* classyc apps spawned for "handler": "jit" dispatch entries. Each is put in
+ * its own process group (pgid == pid) so shutdown can kill the whole tree —
+ * jitrunner forks again internally to run the JIT'd program. */
+#define MAX_JIT_PROCS 32
+static pid_t g_jit_pids[MAX_JIT_PROCS];
+static int g_num_jit_pids = 0;
+
+static void jit_shutdown_children(int sig) {
+    for (int i = 0; i < g_num_jit_pids; i++) {
+        if (g_jit_pids[i] > 0) kill(-g_jit_pids[i], SIGTERM);
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+/* Try to exec `jitrunner` (or a configured override) with jr_argv (NULL-
+ * terminated, jr_argv[0] == runner). Only returns on total failure. For the
+ * default "jitrunner" name, falls back from PATH to classyc's usual install
+ * locations; a custom runner path/name is tried as given, no fallback. */
+static void exec_jitrunner_or_return(const char *runner, char **jr_argv) {
+    execvp(runner, jr_argv);
+    if (strcmp(runner, "jitrunner") == 0) {
+        const char *home = getenv("HOME");
+        if (home) {
+            char pathbuf[PATH_MAX];
+            snprintf(pathbuf, sizeof(pathbuf), "%s/.classyc/bin/jitrunner", home);
+            execv(pathbuf, jr_argv);
+        }
+        execv("/usr/local/bin/jitrunner", jr_argv);
+    }
+}
+
 int main(int argc, char *argv[]) {
     signal(SIGPIPE, SIG_IGN); // Ignoring SIGPIPE
     np_log_init(); /* auto-detect color support */
+
+    /* `npserver jitrunner ...` is a passthrough to the classyc jitrunner
+     * binary (JIT-runs .bmir programs, --watch hot-reload, --dap debugging).
+     * npserver does not link classyc/MIR itself; it just execs jitrunner
+     * with the remaining args. */
+    if (argc > 1 && strcmp(argv[1], "jitrunner") == 0) {
+        exec_jitrunner_or_return("jitrunner", argv + 1);
+        LOG_ERROR(SERVER, "cannot find 'jitrunner' (checked PATH, ~/.classyc/bin, /usr/local/bin) — install classyc or add jitrunner to PATH");
+        return EXIT_FAILURE;
+    }
+
+    /* Clean up spawned jit child process groups on shutdown. */
+    signal(SIGINT, jit_shutdown_children);
+    signal(SIGTERM, jit_shutdown_children);
+
     char *cert_file = NULL;
     char *key_file = NULL;
     int i = 1;
@@ -148,6 +196,49 @@ int main(int argc, char *argv[]) {
                         struct socket_handler_entry she = {.key = strdup(dns_uri), .value = (socket_handler_t)dns_socket_handler};
                         shputs(socket_handler_map, she);
                         LOG_INFO(DNS, "handler on %s (%d entries)", dns_uri, sc.dns.num_entries);
+                    }
+                    continue;
+                }
+
+                if (strcmp(de->handler, "jit") == 0) {
+                    /* Spawn a classyc HTTP app via jitrunner and reverse-proxy
+                     * to the port it binds itself to (jitrunner runs the
+                     * program's main() with no argv, so npserver cannot pass
+                     * --port=; "port" here must match what the app binds). */
+                    if (!de->jit_bmir || de->jit_port <= 0) {
+                        LOG_ERROR(SERVER, "jit dispatch on '%s' needs \"bmir\" and \"port\"", de->listener);
+                        continue;
+                    }
+                    if (access(de->jit_bmir, R_OK) != 0) {
+                        /* Don't spawn: with --watch, jitrunner busy-loops retrying a
+                         * missing file instead of exiting. */
+                        LOG_ERROR(SERVER, "jit dispatch on '%s': bmir '%s' not found, skipping", de->listener, de->jit_bmir);
+                        continue;
+                    }
+                    const char *runner = de->jit_runner ? de->jit_runner : "jitrunner";
+                    pid_t jpid = fork();
+                    if (jpid == 0) {
+                        setpgid(0, 0); /* own process group: kill(-pgid) reaches jitrunner's forked child too */
+                        char *jr_argv[4];
+                        int ai = 0;
+                        jr_argv[ai++] = (char *)runner;
+                        jr_argv[ai++] = (char *)de->jit_bmir;
+                        if (de->jit_watch) jr_argv[ai++] = "--watch";
+                        jr_argv[ai] = NULL;
+                        exec_jitrunner_or_return(runner, jr_argv);
+                        fprintf(stderr, "npserver: cannot exec '%s' for jit handler on '%s'\n", runner, de->listener);
+                        _exit(127);
+                    } else if (jpid > 0) {
+                        setpgid(jpid, jpid); /* also from the parent, to avoid the exec race */
+                        if (g_num_jit_pids < MAX_JIT_PROCS) g_jit_pids[g_num_jit_pids++] = jpid;
+                        char target[64];
+                        snprintf(target, sizeof(target), "http://127.0.0.1:%d", de->jit_port);
+                        addLocation(prefix, target, 1001, 1001);
+                        addHandler(prefix, proxy_handler);
+                        LOG_INFO(SERVER, "jit: spawned %s %s (pid=%d) path=%s -> %s",
+                                runner, de->jit_bmir, jpid, prefix, target);
+                    } else {
+                        LOG_ERROR(SERVER, "jit: fork() failed for '%s': %s", de->listener, strerror(errno));
                     }
                     continue;
                 }
