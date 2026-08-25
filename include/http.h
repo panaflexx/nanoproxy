@@ -88,18 +88,38 @@ static inline void http_parser_init(struct http_parser *parser, int fd) {
 	parser->fd = fd;
 }
 
+/* shputs(parser->req.headers, ...) stores the exact key/value pointers we
+ * strndup'd while parsing (no sh_new_strdup was ever called on this table),
+ * so shfree() below -- which only releases stb_ds's own array/hash-index
+ * memory -- leaves every header's key and value permanently leaked unless
+ * we free them here first. */
+static inline void http_parser_free_req(struct http_request *req) {
+    for (ptrdiff_t i = 0; i < shlen(req->headers); i++) {
+        free(req->headers[i].key);
+        free(req->headers[i].value);
+    }
+    shfree(req->headers);
+    free(req->method);
+    free(req->uri);
+    free(req->version);
+    free(req->body);
+}
+
 static inline void http_parser_reset(struct http_parser *parser) {
-    shfree(parser->req.headers);
-    free(parser->req.method);
-    free(parser->req.uri);
-    free(parser->req.version);
-    free(parser->req.body);
+    http_parser_free_req(&parser->req);
     stringbuf_free(&parser->buffer);
     http_parser_init(parser, parser->fd);
 }
 
+/* Final teardown (parser struct will not be reused) -- must NOT call
+ * http_parser_init/http_parser_reset afterward, since that allocates a
+ * fresh STRINGBUF_DEFAULT_CAP (64 KB) buffer that would then never be
+ * freed: previously this just called http_parser_reset(), leaking exactly
+ * that buffer on every proxied request (proxy_cleanup owns a per-request
+ * proxy_state_t with its own parser) and on every closed connection. */
 static inline void http_parser_destroy(struct http_parser *parser) {
-    http_parser_reset(parser);
+    http_parser_free_req(&parser->req);
+    stringbuf_free(&parser->buffer);
 }
 
 /* Drain any unconsumed data from the parser buffer (used for streaming body) */

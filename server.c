@@ -205,25 +205,32 @@ int main(int argc, char *argv[]) {
                      * to the port it binds itself to (jitrunner runs the
                      * program's main() with no argv, so npserver cannot pass
                      * --port=; "port" here must match what the app binds). */
-                    if (!de->jit_bmir || de->jit_port <= 0) {
+                    if (de->jit_nbmirs <= 0 || de->jit_port <= 0) {
                         LOG_ERROR(SERVER, "jit dispatch on '%s' needs \"bmir\" and \"port\"", de->listener);
                         continue;
                     }
-                    if (access(de->jit_bmir, R_OK) != 0) {
-                        /* Don't spawn: with --watch, jitrunner busy-loops retrying a
-                         * missing file instead of exiting. */
-                        LOG_ERROR(SERVER, "jit dispatch on '%s': bmir '%s' not found, skipping", de->listener, de->jit_bmir);
-                        continue;
+                    int bmir_missing = 0;
+                    for (int bi = 0; bi < de->jit_nbmirs; bi++) {
+                        if (access(de->jit_bmirs[bi], R_OK) != 0) {
+                            /* Don't spawn: with --watch, jitrunner busy-loops retrying a
+                             * missing file instead of exiting. */
+                            LOG_ERROR(SERVER, "jit dispatch on '%s': bmir '%s' not found, skipping",
+                                      de->listener, de->jit_bmirs[bi]);
+                            bmir_missing = 1;
+                        }
                     }
+                    if (bmir_missing) continue;
                     const char *runner = de->jit_runner ? de->jit_runner : "jitrunner";
                     pid_t jpid = fork();
                     if (jpid == 0) {
                         setpgid(0, 0); /* own process group: kill(-pgid) reaches jitrunner's forked child too */
-                        char *jr_argv[4];
+                        char *jr_argv[MAX_JIT_BMIR + 8];
                         int ai = 0;
                         jr_argv[ai++] = (char *)runner;
-                        jr_argv[ai++] = (char *)de->jit_bmir;
+                        for (int bi = 0; bi < de->jit_nbmirs; bi++)
+                            jr_argv[ai++] = (char *)de->jit_bmirs[bi];
                         if (de->jit_watch) jr_argv[ai++] = "--watch";
+                        if (de->jit_mode) { jr_argv[ai++] = "--mode"; jr_argv[ai++] = (char *)de->jit_mode; }
                         jr_argv[ai] = NULL;
                         exec_jitrunner_or_return(runner, jr_argv);
                         fprintf(stderr, "npserver: cannot exec '%s' for jit handler on '%s'\n", runner, de->listener);
@@ -234,9 +241,13 @@ int main(int argc, char *argv[]) {
                         char target[64];
                         snprintf(target, sizeof(target), "http://127.0.0.1:%d", de->jit_port);
                         addLocation(prefix, target, 1001, 1001);
+                        if (de->proxy_keepalive)
+                            setLocationKeepalive(prefix, true, de->proxy_keepalive_pool_size, de->proxy_keepalive_idle_timeout);
                         addHandler(prefix, proxy_handler);
-                        LOG_INFO(SERVER, "jit: spawned %s %s (pid=%d) path=%s -> %s",
-                                runner, de->jit_bmir, jpid, prefix, target);
+                        LOG_INFO(SERVER, "jit: spawned %s %s%s (pid=%d) path=%s -> %s",
+                                runner, de->jit_bmir,
+                                de->jit_nbmirs > 1 ? " (+more)" : "",
+                                jpid, prefix, target);
                     } else {
                         LOG_ERROR(SERVER, "jit: fork() failed for '%s': %s", de->listener, strerror(errno));
                     }
@@ -264,6 +275,8 @@ int main(int argc, char *argv[]) {
                     LOG_INFO(PROXY, "path=%s -> proxy_pass=%s", prefix, proxyv->string_value);
                     char *heap_prefix = strdup(prefix);
                     addLocation(heap_prefix, proxyv->string_value, 1001, 1001);
+                    if (de->proxy_keepalive)
+                        setLocationKeepalive(heap_prefix, true, de->proxy_keepalive_pool_size, de->proxy_keepalive_idle_timeout);
                     addHandler(heap_prefix, proxy_handler);
                 } else if (rootv && rootv->type == DICT_STRING && rootv->string_value) {
                     /* Static file serving */

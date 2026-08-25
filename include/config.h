@@ -27,6 +27,9 @@
 #ifndef MAX_DNS_RECORDS
 #define MAX_DNS_RECORDS 16          /* per name */
 #endif
+#ifndef MAX_JIT_BMIR
+#define MAX_JIT_BMIR 8              /* jitrunner runtime-links this many .bmir */
+#endif
 
 /* ── DNS record types and name→records map ───────────────────────────── */
 
@@ -94,13 +97,29 @@ typedef struct {
     const char *balance;        /* "round-robin", "random", "ip-hash" */
     bool strip_prefix;          /* remove matched path prefix before forwarding */
     int proxy_timeout;          /* connection + idle timeout */
+    /* Upstream keep-alive connection pooling (opt-in, off by default).
+     * Only pools responses framed with Content-Length — chunked or
+     * unknown-length responses always fall back to a fresh per-request
+     * connection, since there'd be no safe way to know where one
+     * response ends and the next begins on a reused socket otherwise. */
+    bool proxy_keepalive;
+    int proxy_keepalive_pool_size;    /* max idle conns per upstream target */
+    int proxy_keepalive_idle_timeout; /* seconds before an idle pooled conn is closed */
     /* Parsed jit fields (populated when handler == "jit") — npserver spawns
      * a classyc HTTP app via `jitrunner` and reverse-proxies to the port it
      * binds itself to. */
-    const char *jit_bmir;       /* path to the compiled .bmir to run */
+    const char *jit_bmir;       /* first / only .bmir (compat; same as jit_bmirs[0]) */
+    const char *jit_bmirs[MAX_JIT_BMIR]; /* all .bmir files passed to jitrunner */
+    int jit_nbmirs;
     int jit_port;                /* port the app binds to (proxy target) */
     bool jit_watch;              /* pass --watch to jitrunner (hot reload) */
     const char *jit_runner;      /* jitrunner binary name/path (default "jitrunner") */
+    const char *jit_mode;        /* pass --mode <value> to jitrunner (e.g. "gen" —
+                                     required for multi-threaded classyc apps: the
+                                     default "lazy" per-function JIT compiles on
+                                     first call with no cross-thread lock, so two
+                                     worker threads racing to first-call the same
+                                     function can hit a MIR assertion */
 } DispatchEntry;
 
 /* Named upstream group for load-balanced proxying */
@@ -627,12 +646,36 @@ static int load_config(const char *path, ServerConfig *cfg, DictValue **root_out
                     DictValue *pto = dict_object_get(v, "timeout");
                     if (pto && pto->type == DICT_INT64) de->proxy_timeout = (int)pto->int64_value;
                     else if (pto && pto->type == DICT_NUMBER) de->proxy_timeout = (int)pto->number_value;
+                    DictValue *ka = dict_object_get(v, "keepalive");
+                    if (ka && ka->type == DICT_BOOL && ka->bool_value) de->proxy_keepalive = true;
+                    DictValue *kps = dict_object_get(v, "keepalive_pool_size");
+                    if (kps && kps->type == DICT_INT64) de->proxy_keepalive_pool_size = (int)kps->int64_value;
+                    else if (kps && kps->type == DICT_NUMBER) de->proxy_keepalive_pool_size = (int)kps->number_value;
+                    DictValue *kit = dict_object_get(v, "keepalive_idle_timeout");
+                    if (kit && kit->type == DICT_INT64) de->proxy_keepalive_idle_timeout = (int)kit->int64_value;
+                    else if (kit && kit->type == DICT_NUMBER) de->proxy_keepalive_idle_timeout = (int)kit->number_value;
+                    if (de->proxy_keepalive) {
+                        if (de->proxy_keepalive_pool_size <= 0) de->proxy_keepalive_pool_size = 4;
+                        if (de->proxy_keepalive_idle_timeout <= 0) de->proxy_keepalive_idle_timeout = 60;
+                        LOG_INFO(CONFIG, "proxy: %s -> keepalive pool_size=%d idle_timeout=%ds",
+                                l, de->proxy_keepalive_pool_size, de->proxy_keepalive_idle_timeout);
+                    }
                 }
 
                 /* Parse jit-specific fields */
                 if (strcmp(h, "jit") == 0) {
                     DictValue *bm = dict_object_get(v, "bmir");
-                    if (bm && bm->type == DICT_STRING) de->jit_bmir = bm->string_value;
+                    if (bm && bm->type == DICT_STRING) {
+                        de->jit_bmirs[0] = bm->string_value;
+                        de->jit_nbmirs = 1;
+                    } else if (bm && bm->type == DICT_ARRAY) {
+                        for (size_t bi = 0; bi < bm->array_value.length && de->jit_nbmirs < MAX_JIT_BMIR; bi++) {
+                            DictValue *it = bm->array_value.items[bi];
+                            if (it && it->type == DICT_STRING && it->string_value)
+                                de->jit_bmirs[de->jit_nbmirs++] = it->string_value;
+                        }
+                    }
+                    de->jit_bmir = de->jit_nbmirs > 0 ? de->jit_bmirs[0] : NULL;
                     DictValue *pt = dict_object_get(v, "port");
                     if (pt && pt->type == DICT_INT64) de->jit_port = (int)pt->int64_value;
                     else if (pt && pt->type == DICT_NUMBER) de->jit_port = (int)pt->number_value;
@@ -640,10 +683,26 @@ static int load_config(const char *path, ServerConfig *cfg, DictValue **root_out
                     if (wt && wt->type == DICT_BOOL && wt->bool_value) de->jit_watch = true;
                     DictValue *jr = dict_object_get(v, "jitrunner");
                     if (jr && jr->type == DICT_STRING) de->jit_runner = jr->string_value;
+                    DictValue *jm = dict_object_get(v, "mode");
+                    if (jm && jm->type == DICT_STRING) de->jit_mode = jm->string_value;
                     DictValue *sp = dict_object_get(v, "strip_prefix");
                     if (sp && sp->type == DICT_BOOL && sp->bool_value) de->strip_prefix = true;
-                    LOG_INFO(CONFIG, "jit: %s -> bmir=%s port=%d watch=%d",
-                            l, de->jit_bmir ? de->jit_bmir : "(null)", de->jit_port, de->jit_watch);
+                    DictValue *ka = dict_object_get(v, "keepalive");
+                    if (ka && ka->type == DICT_BOOL && ka->bool_value) de->proxy_keepalive = true;
+                    DictValue *kps = dict_object_get(v, "keepalive_pool_size");
+                    if (kps && kps->type == DICT_INT64) de->proxy_keepalive_pool_size = (int)kps->int64_value;
+                    else if (kps && kps->type == DICT_NUMBER) de->proxy_keepalive_pool_size = (int)kps->number_value;
+                    DictValue *kit = dict_object_get(v, "keepalive_idle_timeout");
+                    if (kit && kit->type == DICT_INT64) de->proxy_keepalive_idle_timeout = (int)kit->int64_value;
+                    else if (kit && kit->type == DICT_NUMBER) de->proxy_keepalive_idle_timeout = (int)kit->number_value;
+                    if (de->proxy_keepalive) {
+                        if (de->proxy_keepalive_pool_size <= 0) de->proxy_keepalive_pool_size = 4;
+                        if (de->proxy_keepalive_idle_timeout <= 0) de->proxy_keepalive_idle_timeout = 60;
+                    }
+                    LOG_INFO(CONFIG, "jit: %s -> bmir=%s%s port=%d watch=%d keepalive=%d",
+                            l, de->jit_bmir ? de->jit_bmir : "(null)",
+                            de->jit_nbmirs > 1 ? " (+more)" : "",
+                            de->jit_port, de->jit_watch, de->proxy_keepalive);
                 }
 
                 cfg->num_dispatch++;

@@ -105,6 +105,13 @@ struct Location {
     char *real_path;
     uid_t user;
     gid_t group;
+    /* Upstream keep-alive pooling for this proxy route (see config.h's
+     * proxy_keepalive* fields) — set via setLocationKeepalive() after
+     * addLocation(), since addLocation()'s own signature is shared with
+     * the static-file handler and every other existing call site. */
+    bool proxy_keepalive;
+    int proxy_keepalive_pool_size;
+    int proxy_keepalive_idle_timeout;
 };
 
 typedef struct {
@@ -130,6 +137,21 @@ static inline void addLocation(const char *prefix, const char *real_path, uid_t 
     }
     struct Location loc = {.real_path = rp, .user = user, .group = group};
     hmputs(locations, ((LocationEntry){.key = p, .value = loc}) );
+}
+
+/* locations is keyed by char* compared via strcmp elsewhere in this file
+ * (hmputs/hmgeti on a bare char* key would compare pointer identity, not
+ * string content), so this uses the same linear-scan-by-strcmp lookup as
+ * http_static_dir rather than hmgeti. */
+static inline void setLocationKeepalive(const char *prefix, bool keepalive, int pool_size, int idle_timeout) {
+    for (int i = 0; i < hmlen(locations); i++) {
+        if (strcmp(locations[i].key, prefix) == 0) {
+            locations[i].value.proxy_keepalive = keepalive;
+            locations[i].value.proxy_keepalive_pool_size = pool_size;
+            locations[i].value.proxy_keepalive_idle_timeout = idle_timeout;
+            return;
+        }
+    }
 }
 
 static inline void default_access_log(struct client_info *info, const char *action, int status, size_t br, size_t bw) {
@@ -884,7 +906,109 @@ typedef struct {
     bool is_websocket;     /* true after Upgrade: websocket — connection is a raw tunnel */
     time_t connect_start;  /* timestamp when upstream connect was initiated */
     int proxy_timeout;     /* seconds before connect is considered timed out */
+
+    /* Upstream keep-alive pooling (see setLocationKeepalive / config.h) */
+    bool keepalive_enabled;      /* route opted in */
+    int  keepalive_pool_size;
+    int  keepalive_idle_timeout;
+    bool reused_conn;            /* this upstream_fd came from the idle pool */
+    /* Response framing: parsed from the upstream's own response headers so
+     * a pooled connection's next reuse starts exactly where this response
+     * ends, never mid-body. Only Content-Length responses are trusted for
+     * reuse; chunked/unknown-length always falls back to close-on-EOF. */
+    bool   resp_headers_done;
+    char  *resp_header_buf;      /* accumulates raw bytes until \r\n\r\n found */
+    size_t resp_header_buf_len;
+    long   resp_content_length;  /* -1 = unknown/chunked (not poolable) */
+    bool   resp_chunked;
+    bool   resp_conn_close;      /* upstream response said Connection: close */
+    size_t resp_body_relayed;    /* body bytes relayed to the client so far */
+    bool   resp_poolable;        /* keepalive_enabled && content-length-framed && !resp_conn_close */
 } proxy_state_t;
+
+/* Idle upstream connection pool, keyed by "host:port". Reused connections
+ * are validated optimistically (see keepalive_pool_take): if a reused fd
+ * turns out to be stale, the caller falls back to a fresh connect rather
+ * than erroring out to the client. */
+typedef struct {
+    int fd;
+    time_t idle_since;
+    int idle_timeout;   /* seconds; captured from the route that pooled this conn —
+                            different routes can share a target with different settings */
+} PooledConn;
+typedef struct { char *key; PooledConn *value; } KeepalivePoolEntry; /* value: stb_ds dynamic array of PooledConn */
+static KeepalivePoolEntry *keepalive_pools = NULL;
+
+static inline void keepalive_pool_key(char *out, size_t outsz, const char *host, int port) {
+    snprintf(out, outsz, "%s:%d", host, port);
+}
+
+/* shput/shgeti on a bare `sh` table (no explicit sh_new_arena/sh_new_strdup)
+ * do NOT copy the key string — they store whatever pointer was passed, which
+ * here is always a stack-local buffer (keepalive_pool_key's `key[300]`) that
+ * goes out of scope the instant this function returns. Without this, every
+ * lookup after the one that inserted an entry compares against stale stack
+ * garbage and never matches, so a pooled connection is never found again.
+ * sh_new_strdup makes stb_ds own a persistent copy of each key instead. */
+static inline void keepalive_pools_ensure_init(void) {
+    if (keepalive_pools == NULL) sh_new_strdup(keepalive_pools);
+}
+
+/* Returns an idle fd for host:port, or -1 if none pooled. Caller owns the fd. */
+static inline int keepalive_pool_take(const char *host, int port) {
+    keepalive_pools_ensure_init();
+    char key[300];
+    keepalive_pool_key(key, sizeof(key), host, port);
+    ptrdiff_t idx = shgeti(keepalive_pools, key);
+    if (idx < 0) return -1;
+    PooledConn *conns = keepalive_pools[idx].value;
+    size_t n = arrlenu(conns);
+    if (n == 0) return -1;
+    int fd = conns[n - 1].fd;
+    arrsetlen(conns, n - 1);
+    keepalive_pools[idx].value = conns;
+    return fd;
+}
+
+/* Hands an idle-but-still-open upstream fd back to the pool for reuse.
+ * Closes it instead if the pool for this target is already at capacity. */
+static inline void keepalive_pool_put(const char *host, int port, int fd, int pool_size, int idle_timeout) {
+    keepalive_pools_ensure_init();
+    char key[300];
+    keepalive_pool_key(key, sizeof(key), host, port);
+    ptrdiff_t idx = shgeti(keepalive_pools, key);
+    if (idx < 0) {
+        shput(keepalive_pools, key, NULL);
+        idx = shgeti(keepalive_pools, key);
+    }
+    PooledConn *conns = keepalive_pools[idx].value;
+    if ((int)arrlenu(conns) >= pool_size) {
+        close(fd);
+        return;
+    }
+    PooledConn pc = {.fd = fd, .idle_since = time(NULL), .idle_timeout = idle_timeout};
+    arrput(conns, pc);
+    keepalive_pools[idx].value = conns;
+}
+
+/* Periodic sweep (called from server_timeout_sweep): close pooled
+ * connections that have been idle longer than their own idle_timeout. */
+static inline void keepalive_pool_sweep(time_t now) {
+    for (ptrdiff_t i = 0; i < shlen(keepalive_pools); i++) {
+        PooledConn *conns = keepalive_pools[i].value;
+        size_t n = arrlenu(conns);
+        size_t w = 0;
+        for (size_t r = 0; r < n; r++) {
+            if (conns[r].idle_timeout > 0 && now - conns[r].idle_since > conns[r].idle_timeout) {
+                close(conns[r].fd);
+            } else {
+                conns[w++] = conns[r];
+            }
+        }
+        arrsetlen(conns, w);
+        keepalive_pools[i].value = conns;
+    }
+}
 
 typedef struct { int key; proxy_state_t value; } ProxyEntry;
 static ProxyEntry *proxy_states = NULL;          /* client_fd -> proxy_state_t */
@@ -1063,6 +1187,198 @@ static inline void proxy_on_upstream_event(int loopfd, int fd, int events) {
     if (events & EV_READ)  proxy_on_upstream_read(loopfd, fd);
 }
 
+/* Case-insensitive header value lookup within a raw header block (status
+ * line + header lines, NOT including the terminating blank line). Same
+ * technique as jit_backend's own get_header(). */
+static inline int proxy_header_value(const char *buf, size_t len, const char *name,
+                                      char *out, size_t outsz) {
+    size_t nlen = strlen(name);
+    for (size_t i = 0; i + nlen < len; i++) {
+        if (i > 0 && buf[i - 1] != '\n') continue;
+        bool match = true;
+        for (size_t j = 0; j < nlen; j++) {
+            char a = buf[i + j], b = name[j];
+            if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+            if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+            if (a != b) { match = false; break; }
+        }
+        if (!match) continue;
+        size_t k = i + nlen;
+        if (k >= len || buf[k] != ':') continue;
+        k++;
+        while (k < len && buf[k] == ' ') k++;
+        size_t vstart = k;
+        while (k < len && buf[k] != '\r' && buf[k] != '\n') k++;
+        size_t vlen = k - vstart;
+        if (vlen >= outsz) vlen = outsz - 1;
+        memcpy(out, buf + vstart, vlen);
+        out[vlen] = 0;
+        return 1;
+    }
+    out[0] = 0;
+    return 0;
+}
+
+static inline bool ci_str_contains(const char *hay, const char *needle) {
+    size_t hn = strlen(hay), nn = strlen(needle);
+    if (nn == 0 || nn > hn) return false;
+    for (size_t i = 0; i + nn <= hn; i++) {
+        if (strncasecmp(hay + i, needle, nn) == 0) return true;
+    }
+    return false;
+}
+
+/* Relay one chunk of upstream bytes for a keepalive-enabled route: parses
+ * the response's own status/header block once (Content-Length,
+ * Transfer-Encoding, Connection) to determine whether the connection can
+ * safely be pooled, rewrites the Connection header relayed to the client
+ * to match the real client-facing decision instead of relaying the
+ * upstream's verbatim, and completes the exchange (pool or close, see
+ * proxy_cleanup) by counted bytes rather than waiting for the upstream to
+ * close — required since a poolable connection is never closed by us. */
+static inline void proxy_relay_upstream_keepalive(int loopfd, int client_fd, int upstream_fd,
+                                                   proxy_state_t *ps, const char *buf, size_t n) {
+    if (!ps->resp_headers_done) {
+        size_t newlen = ps->resp_header_buf_len + n;
+        char *grown = (char *)realloc(ps->resp_header_buf, newlen + 1);
+        if (!grown) { proxy_cleanup(client_fd); return; }
+        memcpy(grown + ps->resp_header_buf_len, buf, n);
+        grown[newlen] = 0;
+        ps->resp_header_buf = grown;
+        ps->resp_header_buf_len = newlen;
+
+        char *hdr_end = strstr(ps->resp_header_buf, "\r\n\r\n");
+        if (!hdr_end) {
+            if (ps->resp_header_buf_len > 16384) {
+                /* Malformed/oversized headers: give up on framing, just
+                 * relay what we have and fall back to raw pass-through
+                 * (not poolable) for the rest. */
+                ps->resp_headers_done = true;
+                ps->resp_poolable = false;
+                socket_write(client_fd, ps->resp_header_buf, ps->resp_header_buf_len);
+                free(ps->resp_header_buf);
+                ps->resp_header_buf = NULL;
+                ps->resp_header_buf_len = 0;
+            }
+            return; /* wait for more header bytes */
+        }
+
+        size_t header_block_len = (size_t)(hdr_end - ps->resp_header_buf) + 4;
+        const char *body_start = ps->resp_header_buf + header_block_len;
+        size_t body_avail = ps->resp_header_buf_len - header_block_len;
+
+        char val[64];
+        long content_length = -1;
+        if (proxy_header_value(ps->resp_header_buf, header_block_len, "Content-Length", val, sizeof(val)))
+            content_length = atol(val);
+        bool chunked = false;
+        if (proxy_header_value(ps->resp_header_buf, header_block_len, "Transfer-Encoding", val, sizeof(val)))
+            chunked = ci_str_contains(val, "chunked");
+        bool conn_close = false;
+        if (proxy_header_value(ps->resp_header_buf, header_block_len, "Connection", val, sizeof(val)))
+            conn_close = (strcasecmp(val, "close") == 0);
+
+        ps->resp_content_length = content_length;
+        ps->resp_chunked = chunked;
+        ps->resp_conn_close = conn_close;
+        ps->resp_poolable = ps->keepalive_enabled && !chunked && content_length >= 0 && !conn_close;
+        PROXY_LOG("[PROXY-KA] resp cl=%ld chunked=%d conn_close=%d poolable=%d upstream_fd=%d\n",
+                  content_length, chunked, conn_close, ps->resp_poolable, upstream_fd);
+
+        int ci = get_conn(client_fd);
+        bool client_wants_ka = (ci >= 0) && http_should_keep_alive(&clients[ci].parser.req);
+        bool final_ka = ps->resp_poolable && client_wants_ka;
+
+        /* Rebuild the header block: status line + every header except any
+         * existing Connection line, then our own Connection line. */
+        StringBuf outsb;
+        stringbuf_init(&outsb, header_block_len + 32);
+        {
+            const char *p = ps->resp_header_buf;
+            const char *block_end = ps->resp_header_buf + header_block_len - 2; /* before the final \r\n */
+            bool first = true;
+            while (p < block_end) {
+                const char *eol = strstr(p, "\r\n");
+                if (!eol || eol > block_end) eol = block_end;
+                size_t linelen = (size_t)(eol - p);
+                if (first) {
+                    stringbuf_append(&outsb, p, linelen);
+                    stringbuf_append(&outsb, "\r\n", 2);
+                    first = false;
+                } else if (linelen >= 11 && strncasecmp(p, "Connection:", 11) == 0) {
+                    /* dropped: we emit our own line below */
+                } else if (linelen > 0) {
+                    stringbuf_append(&outsb, p, linelen);
+                    stringbuf_append(&outsb, "\r\n", 2);
+                }
+                p = eol + 2;
+            }
+        }
+        stringbuf_appendf(&outsb, "Connection: %s\r\n\r\n", final_ka ? "keep-alive" : "close");
+
+        size_t total = outsb.size + body_avail;
+        char *combined = (char *)malloc(total);
+        if (!combined) { stringbuf_free(&outsb); proxy_cleanup(client_fd); return; }
+        memcpy(combined, outsb.data, outsb.size);
+        if (body_avail) memcpy(combined + outsb.size, body_start, body_avail);
+        stringbuf_free(&outsb);
+
+        ps->resp_headers_done = true;
+        free(ps->resp_header_buf);
+        ps->resp_header_buf = NULL;
+        ps->resp_header_buf_len = 0;
+
+        ssize_t w = socket_write(client_fd, combined, total);
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) w = 0;
+        if (w < 0) { free(combined); proxy_cleanup(client_fd); return; }
+        if ((size_t)w < total) {
+            size_t rem = total - (size_t)w;
+            ps->downstream_buf = (char *)realloc(ps->downstream_buf, rem);
+            if (!ps->downstream_buf) { free(combined); proxy_cleanup(client_fd); return; }
+            memcpy(ps->downstream_buf, combined + w, rem);
+            ps->downstream_len = rem;
+            ps->downstream_sent = 0;
+            ps->upstream_paused = true;
+            event_del(loopfd, upstream_fd, EV_READ, NULL);
+            event_set(loopfd, client_fd, EV_READ | EV_WRITE);
+        }
+        free(combined);
+
+        if (body_avail > 0) ps->resp_body_relayed += body_avail;
+
+        {
+            int ci2 = get_conn(client_fd);
+            if (ci2 >= 0 && clients[ci2].log_action == NULL) {
+                clients[ci2].log_action = strdup("GET proxy HTTP/1.1");
+                clients[ci2].log_status = 200;
+            }
+        }
+
+        if (ps->resp_content_length >= 0 && ps->resp_body_relayed >= (size_t)ps->resp_content_length)
+            proxy_cleanup(client_fd);
+        return;
+    }
+
+    /* Headers already parsed for this response: pure body relay. */
+    ssize_t w = socket_write(client_fd, buf, n);
+    if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) w = 0;
+    if (w < 0) { proxy_cleanup(client_fd); return; }
+    if ((size_t)w < n) {
+        size_t rem = n - (size_t)w;
+        ps->downstream_buf = (char *)realloc(ps->downstream_buf, rem);
+        if (!ps->downstream_buf) { proxy_cleanup(client_fd); return; }
+        memcpy(ps->downstream_buf, buf + w, rem);
+        ps->downstream_len = rem;
+        ps->downstream_sent = 0;
+        ps->upstream_paused = true;
+        event_del(loopfd, upstream_fd, EV_READ, NULL);
+        event_set(loopfd, client_fd, EV_READ | EV_WRITE);
+    }
+    ps->resp_body_relayed += n;
+    if (ps->resp_content_length >= 0 && ps->resp_body_relayed >= (size_t)ps->resp_content_length)
+        proxy_cleanup(client_fd);
+}
+
 /* Called from the main event loop when the upstream becomes readable */
 static inline void proxy_on_upstream_read(int loopfd, int upstream_fd) {
     PROXY_LOG("[PROXY-UP] read event on upstream_fd=%d\n", upstream_fd);
@@ -1087,6 +1403,11 @@ static inline void proxy_on_upstream_read(int loopfd, int upstream_fd) {
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
         if (n < 0) PROXY_LOG("[PROXY-UP]   read errno=%d (%s)\n", errno, strerror(errno));
         proxy_cleanup(client_fd);
+        return;
+    }
+
+    if (ps->keepalive_enabled) {
+        proxy_relay_upstream_keepalive(loopfd, client_fd, upstream_fd, ps, buf, (size_t)n);
         return;
     }
 
@@ -1147,7 +1468,20 @@ static inline void proxy_cleanup(int client_fd) {
             event_del(g_loopfd, ps->upstream_fd, EV_WRITE, NULL);
         }
         hmdel(upstream_fd_to_client, ps->upstream_fd);
-        close(ps->upstream_fd);
+        /* A fully-relayed, Content-Length-framed response on a keepalive-
+         * enabled route goes back to the idle pool instead of closing —
+         * see resp_poolable's assignment in proxy_on_upstream_read. Every
+         * other case (feature not configured for this route, chunked/
+         * unknown-length response, explicit upstream Connection: close,
+         * or cleanup from an error/EOF path where resp_poolable was never
+         * set true) closes exactly as before. */
+        if (ps->resp_poolable && !ps->is_websocket) {
+            PROXY_LOG("[PROXY-KA] pooling upstream_fd=%d for %s:%d\n", ps->upstream_fd, ps->upstream_host, ps->upstream_port);
+            keepalive_pool_put(ps->upstream_host, ps->upstream_port, ps->upstream_fd,
+                               ps->keepalive_pool_size, ps->keepalive_idle_timeout);
+        }
+        else
+            close(ps->upstream_fd);
     }
     /* Emit standard access log and restore client state */
     {
@@ -1162,15 +1496,20 @@ static inline void proxy_cleanup(int client_fd) {
                 free(cd->log_action);
                 cd->log_action = NULL;
             }
-            /* Always close the client-facing side after a proxied response.
-             * The upstream leg is always told "Connection: close" (no
-             * upstream connection pooling — see upstream request building)
-             * and its response bytes, including that header, are relayed to
-             * the client verbatim. Deciding keep-alive independently here
-             * from the client's own request would contradict what was
-             * already sent to the client and leave a socket open that a
-             * client obeying its "Connection: close" header won't reuse. */
-            conn_del(client_fd);
+            /* Client-facing keep-alive is only safe when the response we
+             * just relayed was resp_poolable — i.e. its Connection header
+             * (rewritten in proxy_on_upstream_read to match this exact
+             * decision) actually told the client "keep-alive". Any other
+             * path (feature off, chunked/unknown-length, upstream said
+             * close) always told the client "close" too, so closing here
+             * matches what was already sent — never leaves a socket open
+             * that a client obeying a "close" header won't reuse. */
+            if (ps->resp_poolable && http_should_keep_alive(&cd->parser.req)) {
+                http_parser_reset(&cd->parser);
+                event_set(g_loopfd, client_fd, EV_READ);
+            } else {
+                conn_del(client_fd);
+            }
         }
     }
     http_parser_destroy(&ps->parser);
@@ -1178,6 +1517,7 @@ static inline void proxy_cleanup(int client_fd) {
     free(ps->proxy_prefix);
     free(ps->pending);
     free(ps->downstream_buf);
+    free(ps->resp_header_buf);
     /* Decrement upstream pool connection counter */
     if (ps->pool_name && ps->pool_target_url) {
         upstream_pool_dec_conn(ps->pool_name, ps->pool_target_url);
@@ -1532,38 +1872,69 @@ static inline void proxy_handler(struct http_parser *p, struct http_request *req
     }
     PROXY_LOG("[PROXY] connecting to %s:%d (from proxy_pass)\n", host, port);
 
-    /* Resolve host via getaddrinfo (AF_UNSPEC: works for IPv4, IPv6, hostnames) */
-    struct addrinfo proxy_hints = {0}, *proxy_res = NULL;
-    proxy_hints.ai_family = AF_UNSPEC;
-    proxy_hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(host, portstr, &proxy_hints, &proxy_res) != 0 || !proxy_res) {
-        PROXY_LOG("[PROXY] getaddrinfo failed for %s:%s\n", host, portstr);
-        if (pool_name_resolved) { upstream_pool_dec_conn(pool_name_resolved, pool_target_resolved); free(pool_name_resolved); free(pool_target_resolved); }
-        http_error(p, 502, "Bad Gateway");
-        return;
-    }
+    bool keepalive_enabled = locations[loc_idx].value.proxy_keepalive;
+    int keepalive_pool_size = locations[loc_idx].value.proxy_keepalive_pool_size;
+    int keepalive_idle_timeout = locations[loc_idx].value.proxy_keepalive_idle_timeout;
 
-    /* Try each resolved address until connect succeeds or returns EINPROGRESS */
+    /* Try to reuse a pooled idle connection first. Validated optimistically
+     * with a non-blocking MSG_PEEK: catches the common case (upstream
+     * already closed it, e.g. its own idle timeout) without needing to
+     * keep idle connections registered in the event loop just to watch for
+     * that. A connection that dies in the instant between this check and
+     * actually sending the next request isn't retried — same as any other
+     * upstream failure (see README's "No Proxy Retry / Failover"). */
     int upstream = -1;
-    for (struct addrinfo *ai = proxy_res; ai; ai = ai->ai_next) {
-        upstream = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (upstream < 0) continue;
-        fcntl(upstream, F_SETFL, O_NONBLOCK);
-        int c = connect(upstream, ai->ai_addr, ai->ai_addrlen);
-        if (c == 0 || errno == EINPROGRESS) {
-            PROXY_LOG("[PROXY] connect to %s:%d fd=%d (family=%d)\n", host, port, upstream, ai->ai_family);
-            break;
+    bool reused_conn = false;
+    if (keepalive_enabled) {
+        int pooled = keepalive_pool_take(host, port);
+        PROXY_LOG("[PROXY-KA] pool_take(%s:%d) -> %d\n", host, port, pooled);
+        if (pooled >= 0) {
+            char peekbuf[1];
+            ssize_t pk = recv(pooled, peekbuf, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (pk == 0 || (pk < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+                PROXY_LOG("[PROXY] pooled conn for %s:%d was stale, discarding\n", host, port);
+                close(pooled);
+            } else {
+                upstream = pooled;
+                reused_conn = true;
+                PROXY_LOG("[PROXY] reused pooled upstream_fd=%d for %s:%d\n", upstream, host, port);
+            }
         }
-        close(upstream);
-        upstream = -1;
     }
-    freeaddrinfo(proxy_res);
 
     if (upstream < 0) {
-        PROXY_LOG("[PROXY] all connect attempts failed for %s:%d\n", host, port);
-        if (pool_name_resolved) { upstream_pool_dec_conn(pool_name_resolved, pool_target_resolved); free(pool_name_resolved); free(pool_target_resolved); }
-        http_error(p, 502, "Bad Gateway");
-        return;
+        /* Resolve host via getaddrinfo (AF_UNSPEC: works for IPv4, IPv6, hostnames) */
+        struct addrinfo proxy_hints = {0}, *proxy_res = NULL;
+        proxy_hints.ai_family = AF_UNSPEC;
+        proxy_hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(host, portstr, &proxy_hints, &proxy_res) != 0 || !proxy_res) {
+            PROXY_LOG("[PROXY] getaddrinfo failed for %s:%s\n", host, portstr);
+            if (pool_name_resolved) { upstream_pool_dec_conn(pool_name_resolved, pool_target_resolved); free(pool_name_resolved); free(pool_target_resolved); }
+            http_error(p, 502, "Bad Gateway");
+            return;
+        }
+
+        /* Try each resolved address until connect succeeds or returns EINPROGRESS */
+        for (struct addrinfo *ai = proxy_res; ai; ai = ai->ai_next) {
+            upstream = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+            if (upstream < 0) continue;
+            fcntl(upstream, F_SETFL, O_NONBLOCK);
+            int c = connect(upstream, ai->ai_addr, ai->ai_addrlen);
+            if (c == 0 || errno == EINPROGRESS) {
+                PROXY_LOG("[PROXY] connect to %s:%d fd=%d (family=%d)\n", host, port, upstream, ai->ai_family);
+                break;
+            }
+            close(upstream);
+            upstream = -1;
+        }
+        freeaddrinfo(proxy_res);
+
+        if (upstream < 0) {
+            PROXY_LOG("[PROXY] all connect attempts failed for %s:%d\n", host, port);
+            if (pool_name_resolved) { upstream_pool_dec_conn(pool_name_resolved, pool_target_resolved); free(pool_name_resolved); free(pool_target_resolved); }
+            http_error(p, 502, "Bad Gateway");
+            return;
+        }
     }
 
     /* Register upstream in the event loop for BOTH read and write (need write until connected) */
@@ -1587,7 +1958,7 @@ static inline void proxy_handler(struct http_parser *p, struct http_request *req
     /* Store proxy state */
     proxy_state_t ps = {0};
     ps.upstream_fd = upstream;
-    ps.connected = false;
+    ps.connected = reused_conn;   /* reused connections are already established */
     ps.headers_sent = false;
     ps.upstream_host = strdup(host);
     ps.upstream_port = port;
@@ -1602,15 +1973,23 @@ static inline void proxy_handler(struct http_parser *p, struct http_request *req
     ps.proxy_timeout = pool_name_resolved
         ? upstream_pool_get_proxy_timeout(pool_name_resolved)
         : DEFAULT_PROXY_TIMEOUT;
+    ps.keepalive_enabled = keepalive_enabled;
+    ps.keepalive_pool_size = keepalive_pool_size;
+    ps.keepalive_idle_timeout = keepalive_idle_timeout;
+    ps.reused_conn = reused_conn;
+    ps.resp_content_length = -1;  /* unknown until headers are parsed */
     http_parser_init(&ps.parser, upstream);
     hmputs(proxy_states, ((ProxyEntry){cd->fd, ps}));
     hmputs(upstream_fd_to_client, ((UpstreamFdEntry){upstream, cd->fd}));
     PROXY_LOG("[PROXY] stored proxy state client_fd=%d -> upstream=%d streaming=%d\n", cd->fd, upstream, is_streaming);
 
-    /* Set up standard access log for this proxy request */
+    /* Set up standard access log for this proxy request. http_dispatcher
+     * already strdup'd one into cd->log_action before calling us -- free it
+     * first instead of just overwriting the pointer. */
     {
         char action[512];
         snprintf(action, sizeof(action), "%s %s %s", req->method ? req->method : "GET", req->uri ? req->uri : "/", req->version ? req->version : "HTTP/1.1");
+        free(cd->log_action);
         cd->log_action = strdup(action);
         cd->log_status = 200;
     }
@@ -1637,6 +2016,8 @@ static inline void proxy_handler(struct http_parser *p, struct http_request *req
     stringbuf_appendf(&sb, "Host: %s:%d\r\n", host, port);
     if (is_websocket) {
         stringbuf_append(&sb, "Connection: Upgrade\r\n", 21);
+    } else if (keepalive_enabled) {
+        stringbuf_append(&sb, "Connection: keep-alive\r\n", 24);
     } else {
         stringbuf_append(&sb, "Connection: close\r\n", 19);
     }
@@ -1952,6 +2333,7 @@ static inline void connection_timeout_sweep(int loopfd) {
 static inline void server_timeout_sweep(int loopfd) {
     proxy_timeout_sweep(loopfd);
     connection_timeout_sweep(loopfd);
+    keepalive_pool_sweep(time(NULL));
 }
 
 /* Global loopfd used by proxy (set from server.c) */

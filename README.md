@@ -257,33 +257,89 @@ npserver uses a single JSON config file. All features — listeners, static serv
 | Handler    | What it does                                  | Key fields                                  |
 |------------|-----------------------------------------------|---------------------------------------------|
 | `static`   | Serve files from a directory                  | `root`, `index`                             |
-| `proxy`    | HTTP reverse proxy (+ WebSocket auto-detect)  | `proxy_pass`, `path`                        |
+| `proxy`    | HTTP reverse proxy (+ WebSocket auto-detect)  | `proxy_pass`, `path`, `keepalive`           |
 | `forward`  | Raw TCP/UDP/Unix bidirectional relay          | `forward_to`, `mode`, `timeout`, `buffer_size` |
 | `dns`      | Authoritative DNS from the `dns` config block | *(none — uses the top-level `dns` section)* |
-| `jit`      | Spawn a classyc-JIT'd HTTP API via `jitrunner`, reverse-proxy to it | `bmir`, `port`, `watch`, `path` |
+| `jit`      | Spawn a classyc-JIT'd HTTP API via `jitrunner`, reverse-proxy to it | `bmir`, `port`, `watch`, `mode`, `path`, `keepalive` |
+
+#### `keepalive`: pool upstream connections instead of one per request
+
+`{ "handler": "proxy", "proxy_pass": "http://127.0.0.1:8000", "path": "/api/**", "keepalive": true, "keepalive_pool_size": 4, "keepalive_idle_timeout": 60 }`
+
+Off by default: every proxied request opens a fresh upstream connection
+and tells the upstream `Connection: close` (see "No Proxy Retry /
+Failover" below — there's still no retry on a failed upstream). Turning
+`keepalive` on for a route pools idle upstream connections per target
+(`host:port`) instead, reusing them across requests — this matters a lot
+under load, since opening a fresh TCP connection per request is a fixed
+cost on top of whatever the request itself takes (measured: proxying a
+sub-millisecond endpoint through a fresh connection each time was ~3x
+slower than reusing one; a 15ms database-backed endpoint saw a much
+smaller relative hit, since the fixed per-connection cost is a smaller
+fraction of a slower request).
+
+**Only pools responses framed with `Content-Length`.** Reusing a
+connection safely requires knowing exactly where one response ends and
+the next begins; chunked or unknown-length responses (or an upstream
+that explicitly sends `Connection: close`) always fall back to a fresh
+per-request connection rather than risk corrupting a reused one.
+Pooled connections are validated optimistically on reuse (a quick
+non-blocking `MSG_PEEK`, catching the common case of an upstream that
+already closed an idle connection on its own timeout) — a connection
+that goes stale in the instant between that check and actually being
+used isn't retried, same as any other upstream failure.
+
+**Size `keepalive_pool_size` (default 4) below the upstream's own
+concurrency capacity, not up to it.** A backend typically allocates one
+worker/thread per *open* connection, including ones sitting idle in
+npserver's pool — so a pool sized at or above the backend's own worker
+count can tie up every worker just idling for npserver, starving
+anything else that hits the backend (a direct request, a health check,
+another listener's own `proxy_pass` to the same target). `jit_backend`
+runs 8 workers; its `config.json` entry deliberately pools only 4.
+`keepalive_idle_timeout` (default 60s) closes a pooled connection that's
+sat unused that long — keep it comfortably above the backend's own
+idle-connection timeout if it has one, or every pooled connection will
+already be stale by the time npserver tries to reuse it.
 
 #### `jit`: run a classyc HTTP API behind npserver
 
 `{ "handler": "jit", "bmir": "jit/app.bmir", "port": 18099, "watch": true, "path": "/jit/**" }`
 
-At startup npserver execs `jitrunner <bmir> [--watch]` as a child process
-(its own process group, so shutdown kills it cleanly) and wires the
-matched `path` to reverse-proxy to `http://127.0.0.1:<port>` — the same
-"proxy" machinery used everywhere else, just pointed at a process
-npserver itself launched. If `bmir` doesn't exist at startup the route is
-skipped with a logged error (no spawn) rather than looping — with
-`--watch`, jitrunner busy-retries a missing file, so npserver refuses to
-start that.
+`bmir` may be a string or an array of `.bmir` files — jitrunner loads
+them all into one MIR context and runtime-links them (HTTP core + app):
 
-**`port` must match what the app itself binds.** `jitrunner` currently
-runs the JIT'd program's `main()` with no `argv`, so npserver has no way
-to pass `--port=` through — set `port` to whatever the compiled program
-hardcodes (or reads from its own config/env). Build the `.bmir` with
-classyc: `classyc -I include -c -g -o jit/app.bmir jit/app.cy`. See
-classyc's `examples/http_crud` for what a real routed HTTP API looks
-like (`[[HttpGet]]` + SQLite); multi-file classyc apps currently can't
-be combined into one `.bmir` via `-c -o`, so `jit` targets need to be a
-single `.cy`/`.c` translation unit today.
+`{ "handler": "jit", "bmir": ["jit_backend/app.bmir", "jit_backend/api.bmir"], "port": 8000, "mode": "gen", "path": "/api/**" }`
+
+At startup npserver execs `jitrunner <bmir...> [--watch] [--mode <mode>]` as
+a child process (its own process group, so shutdown kills it cleanly) and
+wires the matched `path` to reverse-proxy to `http://127.0.0.1:<port>` —
+the same "proxy" machinery used everywhere else, just pointed at a
+process npserver itself launched. If `bmir` doesn't exist at startup the
+route is skipped with a logged error (no spawn) rather than looping —
+with `--watch`, jitrunner busy-retries a missing file, so npserver
+refuses to start that.
+
+**`port` must match what the app itself binds.** `jitrunner` runs the
+JIT'd program's `main()` with no `argv`, so npserver has no way to pass
+`--port=` through — set `port` to whatever the compiled program hardcodes
+(or reads from its own config/env).
+
+**`mode`** passes `--mode <value>` to jitrunner (`lazy` (default) / `gen`
+/ `interp`). Any classyc app that runs its own worker threads (e.g.
+`jit_backend`, or `http-serve-cchan.c`'s `serve_workers_cchan`) needs
+`"mode": "gen"` — jitrunner's default lazy per-function JIT has no
+cross-thread lock around first-call compilation, so two worker threads
+racing to first-call the same function can hit a MIR assertion and crash.
+`gen` compiles everything upfront on the main thread before any worker
+starts, which avoids that race.
+
+Build each `.bmir` with classyc `-c` (one TU per file), then pass them
+all to jitrunner / `"bmir": [...]`. Combining sources into one `.bmir`
+(`classyc -o app.bmir a.cy b.cy`, no `-c`) still works if you prefer.
+See classyc's `examples/http_crud` for what a real routed HTTP API looks
+like (`[[HttpGet]]` + SQLite) and `jit_backend/` in this repo for a
+worked single-file example with its own worker pool.
 
 ### Load Balancing Algorithms
 
