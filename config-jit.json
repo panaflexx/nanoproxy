@@ -1,0 +1,209 @@
+{
+  // npserver config — static files, reverse proxy, port forwarding, protocol translation
+  "listen": [
+    { "name": "web", "uri": "http://:8080" },
+    { "name": "tls", "uri": "https://:8443" },
+    { "name": "dns-in", "uri": "udp://127.0.0.1:5353" },
+    { "name": "db-local", "uri": "tcp://:3307" },
+    { "name": "sidecar", "uri": "tcp://:9000" },
+    { "name": "gameproxy", "uri": "udp://:27015" },
+    { "name": "local", "uri": "unix:///tmp/app.sock" }
+  ],
+  "tls": {
+	// Use the make_test_cert.sh script to make these for testing
+    "cert": "testsite.crt",
+    "key": "testsite.key"
+  },
+  "backlog": 2048,
+
+  // Connection timeouts (seconds) — tune for your workload
+  // All values optional; built-in defaults shown here
+  "timeouts": {
+    "header": 10, // max seconds to receive complete request headers (Slowloris defense)
+    "body": 30, // max seconds between body data chunks
+    "idle": 60, // keep-alive idle timeout before closing
+    "max_connections_per_ip": 500 // per-IP connection cap (basic DoS defense, 0 = unlimited)
+  },
+
+  // Per-subsystem log levels: trace, debug, info, warn (default), error, fatal, off
+  // format: "pretty" (default, colored) or "json" (structured, one JSON object per line)
+  // Omit this section entirely for quiet defaults (warn-only).
+  "logging": {
+    "format": "pretty",
+    "access_log": "stdout", // "stdout" (default), "stderr", "off", or a file path
+    "config": "warn",
+    "server": "warn",
+    "proxy": "warn"
+  },
+
+  "dns_ttl": 300,
+
+  // Built-in DNS resolver (serves on any udp:// listener with handler "dns")
+  "dns": {
+    "redis.local": { "A": "192.168.11.2", "AAAA": "fd00::2" },
+    "postgres.local": { "A": "192.168.11.3" },
+    "web.local": { "A": ["10.0.0.10", "10.0.0.11"], "AAAA": "fd00::10" },
+    "app.local": { "CNAME": "web.local" },
+    "cache.local": { "A": "192.168.11.4", "TTL": 60 },
+    "example.com": {
+      "A": "93.184.216.34",
+      "MX": [
+        { "priority": 10, "host": "mx1.example.com" },
+        { "priority": 20, "host": "mx2.example.com" }
+      ],
+      "TXT": [
+        "v=spf1 include:example.com ~all",
+        "google-site-verification=abc123"
+      ],
+      "NS": ["ns1.example.com", "ns2.example.com"]
+    },
+    "_http._tcp.web.local": {
+      "SRV": {
+        "priority": 0,
+        "weight": 100,
+        "port": 8080,
+        "target": "web.local"
+      }
+    }
+  },
+
+  // Named upstream groups for load balancing
+  // balance: "round-robin" | "ip-hash" | "conn-hash" | "least-conn" | "random"
+  "upstreams": {
+    "app_pool": {
+      "targets": [
+        "http://127.0.0.1:8001",
+        "http://127.0.0.1:8002",
+        "http://127.0.0.1:8003"
+      ],
+      "balance": "round-robin",
+      "health_check": { "path": "/healthz", "interval": 10 },
+      "proxy_timeout_seconds": 5,
+      "retry_timeout_seconds": 30
+    },
+    "ws_pool": {
+      "targets": ["http://127.0.0.1:8010", "http://127.0.0.1:8011"],
+      "balance": "least-conn",
+      "proxy_timeout_seconds": 5,
+      "retry_timeout_seconds": 30
+    }
+  },
+
+  "dispatch": [
+    // -- Static file serving --
+    {
+      "listener": "web",
+      "handler": "static",
+      "root": "./public",
+      "index": "index.html"
+    },
+    { "listener": "tls", "handler": "static", "root": "./public" },
+
+    // -- Social feed API — classyc JIT backend (see jit_backend/) --
+    //    npserver spawns jit_backend/app.bmir via jitrunner (once, on the
+    //    "web" listener) and reverse-proxies to the port it binds itself
+    //    to (8000). The "tls" listener just proxies to that same already-
+    //    running process — a second "jit" entry here would try to spawn
+    //    a second copy and fail to bind :8000 twice.
+    //    "mode": "gen" is required: jit_backend runs an 8-thread worker
+    //    pool, and jitrunner's default "lazy" per-function JIT compiles on
+    //    first call with no cross-thread lock — two workers racing to
+    //    first-call the same function can hit a MIR assertion. "gen" does
+    //    full codegen upfront, once, before any worker thread starts.
+    //    "keepalive": true pools upstream connections to jit_backend
+    //    instead of opening a fresh one per request (only safe for
+    //    Content-Length-framed responses, which jit_backend always sends —
+    //    see the "keepalive" row in the main README's Handler Types docs).
+    //    "keepalive_pool_size" defaults to 4 — deliberately less than
+    //    jit_backend's 8 worker threads. A backend allocates one worker
+    //    per OPEN connection even while it's sitting idle in npserver's
+    //    pool, so pool_size >= the backend's own worker/concurrency
+    //    capacity can tie up every worker just idling for npserver and
+    //    starve anything else hitting the backend (direct access, the
+    //    "tls" listener's own proxy below, a health check, ...). Keep
+    //    pool_size comfortably under the backend's real concurrency.
+    //    Build first: sh jit_backend/build.sh
+    {
+      "listener": "web",
+      "handler": "jit",
+      "path": "/api/**",
+      "bmir": ["jit_backend/app.bmir", "jit_backend/api.bmir", "jit_backend/jsonbuild.bmir"],
+      "port": 8000,
+      "mode": "gen",
+      "keepalive": true,
+      "keepalive_pool_size": 8
+    },
+    {
+      "listener": "tls",
+      "handler": "proxy",
+      "path": "/api/**",
+      "proxy_pass": "http://127.0.0.1:8000",
+      "timeout": 30,
+      "keepalive": true
+    },
+
+    // -- Load-balanced HTTP proxy via named upstream --
+    {
+      "listener": "web",
+      "handler": "proxy",
+      "path": "/app/**",
+      "proxy_pass": "upstream://app_pool",
+      "balance": "round-robin"
+    },
+
+    // -- Raw TCP forwarding (like ssh -L 3307:dbhost:3306) --
+    //    Accept on :3307, relay bytes to remote MySQL
+    {
+      "listener": "db-local",
+      "handler": "forward",
+      "forward_to": "tcp://dbserver.internal:3306",
+      "timeout": 300,
+      "max_connections": 20,
+      "buffer_size": 65536
+    },
+
+    // -- UDP → UDP forwarding (DNS relay / split-horizon) --
+    {
+      "listener": "dns-in",
+      "handler": "forward",
+      "forward_to": "udp://8.8.8.8:53"
+    },
+
+    // -- TCP → UDP protocol translation --
+    //    Accept TCP on :9000, forward as UDP to StatsD
+    {
+      "listener": "sidecar",
+      "handler": "forward",
+      "forward_to": "udp://statsd.internal:8125",
+      "mode": "datagram"
+    },
+
+    // -- UDP → TCP protocol translation --
+    //    Accept UDP game traffic, forward over TCP to game server
+    {
+      "listener": "gameproxy",
+      "handler": "forward",
+      "forward_to": "tcp://gameserver.internal:27015",
+      "mode": "stream"
+    },
+
+    // -- Unix socket forwarding (container sidecar) --
+    //    Forward from TCP to a local unix socket (e.g. PHP-FPM)
+    {
+      "listener": "sidecar",
+      "handler": "forward",
+      "forward_to": "unix:///var/run/php-fpm.sock"
+    },
+
+    // -- Static media directory --
+    {
+      "listener": "web",
+      "handler": "static",
+      "path": "/usermedia/**",
+      "root": "./jit_backend/usermedia"
+    },
+
+    // -- DNS handler --
+    { "listener": "dns-in", "handler": "dns" }
+  ]
+}
