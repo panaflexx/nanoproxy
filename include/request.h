@@ -390,14 +390,26 @@ static inline void http_static_dir(http_p *p, struct http_request *req, struct c
     }
     if (range_val) {
         if (strncmp(range_val, "bytes=", 6) == 0) {
-            char *dash = strchr(range_val + 6, '-');
-            if (dash) {
-                range_start = atoll(range_val + 6);
-                if (dash[1]) range_end = atoll(dash + 1);
-                if (range_start >= 0 && range_end >= range_start && range_end < st.st_size) {
-                    is_range = true;
-                }
-            }
+            const char *nums = range_val + 6;
+            char *dash = strchr(nums, '-');
+	            if (dash) {
+	                /* Use the lightweight view + fast integer parser (no alloc, no vsscanf) */
+	                StringBuf sb_start;
+	                stringbuf_init_view(&sb_start, nums, dash - nums);
+	                int n;
+	                long long rs = stringbuf_parse_ll(&sb_start, &n);
+	                if (n > 0 && rs >= 0) range_start = (off_t)rs;
+
+	                if (dash[1]) {
+	                    StringBuf sb_end;
+	                    stringbuf_init_view(&sb_end, dash + 1, strlen(dash + 1));
+	                    long long re = stringbuf_parse_ll(&sb_end, &n);
+	                    if (n > 0 && re >= range_start) range_end = (off_t)re;
+	                }
+	                if (range_start >= 0 && range_end >= range_start && range_end < st.st_size) {
+	                    is_range = true;
+	                }
+	            }
         }
     }
 
@@ -530,7 +542,11 @@ static inline void http_static_dir(http_p *p, struct http_request *req, struct c
     cd->send_file_fd = file_fd;
     cd->send_offset = is_range ? range_start : 0;
     cd->send_remaining = content_len;
+    #ifdef HAVE_OPENSSL
     cd->use_sendfile = (cd->ssl == NULL);  // Use sendfile only if no SSL
+    #else
+    cd->use_sendfile = true;
+    #endif
     if (is_range) cd->log_status = 206;
 
     cd->send_buffer = malloc(CHUNK_SIZE);
@@ -1611,7 +1627,8 @@ static inline void upstream_pool_register(const char *name,
                 memcpy(pool.targets[i].host, host_start + 1, hlen);
                 pool.targets[i].host[hlen] = '\0';
                 if (close[1] == ':') {
-                    pool.targets[i].port = atoi(close + 2);
+                    long __p; SAFE_STRTOL(close + 2, &__p, 10); pool.targets[i].port = (int)__p;
+                    if (pool.targets[i].port <= 0 || pool.targets[i].port > 65535) pool.targets[i].port = (url[4] == 's') ? 443 : 80;
                 } else {
                     pool.targets[i].port = (url[4] == 's') ? 443 : 80;
                 }
@@ -1629,7 +1646,8 @@ static inline void upstream_pool_register(const char *name,
                 if (hlen >= sizeof(pool.targets[i].host)) hlen = sizeof(pool.targets[i].host) - 1;
                 memcpy(pool.targets[i].host, host_start, hlen);
                 pool.targets[i].host[hlen] = '\0';
-                pool.targets[i].port = atoi(colon + 1);
+                long __p; SAFE_STRTOL(colon + 1, &__p, 10); pool.targets[i].port = (int)__p;
+                if (pool.targets[i].port <= 0 || pool.targets[i].port > 65535) pool.targets[i].port = (url[4] == 's') ? 443 : 80;
             } else {
                 size_t hlen = (size_t)(p - host_start);
                 if (hlen >= sizeof(pool.targets[i].host)) hlen = sizeof(pool.targets[i].host) - 1;
@@ -1846,7 +1864,8 @@ static inline void proxy_handler(struct http_parser *p, struct http_request *req
         memcpy(host, host_start + 1, hlen);
         host[hlen] = '\0';
         if (close_bracket[1] == ':') {
-            port = atoi(close_bracket + 2);
+            long __p; SAFE_STRTOL(close_bracket + 2, &__p, 10); port = (int)__p;
+            if (port <= 0 || port > 65535) port = 443;
             snprintf(portstr, sizeof(portstr), "%d", port);
         }
     } else {
@@ -1861,7 +1880,8 @@ static inline void proxy_handler(struct http_parser *p, struct http_request *req
             if (hlen >= sizeof(host)) hlen = sizeof(host) - 1;
             memcpy(host, host_start, hlen);
             host[hlen] = '\0';
-            port = atoi(colon + 1);
+            long __p; SAFE_STRTOL(colon + 1, &__p, 10); port = (int)__p;
+            if (port <= 0 || port > 65535) port = 80;
             snprintf(portstr, sizeof(portstr), "%d", port);
         } else {
             size_t hlen = (size_t)(end - host_start);
@@ -2362,7 +2382,7 @@ static inline int parse_forward_target(const char *uri, struct forward_target *f
             if (hlen >= sizeof(ft->host)) hlen = sizeof(ft->host) - 1;
             memcpy(ft->host, hoststart + 1, hlen);
             ft->host[hlen] = '\0';
-            if (close[1] == ':') ft->port = atoi(close + 2);
+            if (close[1] == ':') { long __p; SAFE_STRTOL(close + 2, &__p, 10); ft->port = (int)__p; if (ft->port <= 0 || ft->port > 65535) return 0; }
             else return 0;
         } else {
             const char *colon = strrchr(hoststart, ':');
@@ -2371,7 +2391,8 @@ static inline int parse_forward_target(const char *uri, struct forward_target *f
             if (hlen >= sizeof(ft->host)) hlen = sizeof(ft->host) - 1;
             memcpy(ft->host, hoststart, hlen);
             ft->host[hlen] = '\0';
-            ft->port = atoi(colon + 1);
+            long __p; SAFE_STRTOL(colon + 1, &__p, 10); ft->port = (int)__p;
+            if (ft->port <= 0 || ft->port > 65535) return 0;
         }
     } else if (strncmp(uri, "udp://", 6) == 0) {
         ft->proto = FWD_UDP;
@@ -2383,7 +2404,7 @@ static inline int parse_forward_target(const char *uri, struct forward_target *f
             if (hlen >= sizeof(ft->host)) hlen = sizeof(ft->host) - 1;
             memcpy(ft->host, hoststart + 1, hlen);
             ft->host[hlen] = '\0';
-            if (close[1] == ':') ft->port = atoi(close + 2);
+            if (close[1] == ':') { long __p; SAFE_STRTOL(close + 2, &__p, 10); ft->port = (int)__p; if (ft->port <= 0 || ft->port > 65535) return 0; }
             else return 0;
         } else {
             const char *colon = strrchr(hoststart, ':');
@@ -2392,7 +2413,8 @@ static inline int parse_forward_target(const char *uri, struct forward_target *f
             if (hlen >= sizeof(ft->host)) hlen = sizeof(ft->host) - 1;
             memcpy(ft->host, hoststart, hlen);
             ft->host[hlen] = '\0';
-            ft->port = atoi(colon + 1);
+            long __p; SAFE_STRTOL(colon + 1, &__p, 10); ft->port = (int)__p;
+            if (ft->port <= 0 || ft->port > 65535) return 0;
         }
     } else if (strncmp(uri, "unix://", 7) == 0) {
         ft->proto = FWD_UNIX;

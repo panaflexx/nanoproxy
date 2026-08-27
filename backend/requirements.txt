@@ -3,3 +3,4 @@ uvicorn[standard]
 fastapi-login
 python-jose[cryptography]
 bcrypt
+python-multipart

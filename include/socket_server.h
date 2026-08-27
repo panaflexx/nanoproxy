@@ -578,9 +578,9 @@ static inline void parse_client_info(struct sockaddr_storage *addr, socklen_t ad
         strncpy(info->addr, un->sun_path, sizeof(info->addr) - 1);
         info->addr[sizeof(info->addr) - 1] = '\0';
         if (info->addr[0] == '\0') {
-            strcpy(info->addr, "unix");
+            SAFE_STRNCPY(info->addr, "unix", 4, sizeof(info->addr));
         }
-        strcpy(info->hostname, "unix");
+        SAFE_STRNCPY(info->hostname, "unix", 4, sizeof(info->hostname));
         info->port = 0;
     } else if (family == AF_INET) {
         if (is_tls) {
@@ -594,8 +594,9 @@ static inline void parse_client_info(struct sockaddr_storage *addr, socklen_t ad
                               portstr, sizeof(portstr),
                               NI_NUMERICHOST | NI_NUMERICSERV);
         if (ret == 0) {
-            strncpy(info->addr, numeric_host, sizeof(info->addr) - 1);
-            info->port = atoi(portstr);
+            SAFE_STRNCPY(info->addr, numeric_host, strlen(numeric_host), sizeof(info->addr));
+            long __p; SAFE_STRTOL(portstr, &__p, 10); info->port = (int)__p;
+            if (info->port <= 0 || info->port > 65535) info->port = 0;
         } else {
             info->port = 0;
         }
@@ -603,7 +604,7 @@ static inline void parse_client_info(struct sockaddr_storage *addr, socklen_t ad
                           info->hostname, sizeof(info->hostname),
                           NULL, 0, 0);
         if (ret != 0) {
-            strncpy(info->hostname, info->addr, sizeof(info->hostname) - 1);
+            SAFE_STRNCPY(info->hostname, info->addr, strlen(info->addr), sizeof(info->hostname));
         }
     } else if (family == AF_INET6) {
         if (is_tls) {
@@ -617,8 +618,9 @@ static inline void parse_client_info(struct sockaddr_storage *addr, socklen_t ad
                               portstr, sizeof(portstr),
                               NI_NUMERICHOST | NI_NUMERICSERV);
         if (ret == 0) {
-            strncpy(info->addr, numeric_host, sizeof(info->addr) - 1);
-            info->port = atoi(portstr);
+            SAFE_STRNCPY(info->addr, numeric_host, strlen(numeric_host), sizeof(info->addr));
+            long __p; SAFE_STRTOL(portstr, &__p, 10); info->port = (int)__p;
+            if (info->port <= 0 || info->port > 65535) info->port = 0;
         } else {
             info->port = 0;
         }
@@ -626,7 +628,7 @@ static inline void parse_client_info(struct sockaddr_storage *addr, socklen_t ad
                           info->hostname, sizeof(info->hostname),
                           NULL, 0, 0);
         if (ret != 0) {
-            strncpy(info->hostname, info->addr, sizeof(info->hostname) - 1);
+            SAFE_STRNCPY(info->hostname, info->addr, strlen(info->addr), sizeof(info->hostname));
         }
     } else {
         info->type = CONN_UNKNOWN;
