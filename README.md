@@ -8,13 +8,13 @@ Because sometimes you don't need a container orchestrator. You need a Swiss Army
 
 ```
             ┌─────────────────────────────────────┐
-            │             npserver                 │
+            │             npserver                │
             │                                     │
-  HTTP ───▶│  static files  ·  reverse proxy      │
- HTTPS ───▶│  WebSocket     ·  gzip compression   │
-   TCP ───▶│  port forward  ·  load balancing     │
-   UDP ───▶│  DNS server    ·  protocol translate  │
-  Unix ───▶│  TLS terminate ·  sendfile(2)        │
+  HTTP ───▶ │ static files  ·  reverse proxy      │
+ HTTPS ───▶ │ WebSocket     ·  gzip compression   │
+   TCP ───▶ │ port forward  ·  load balancing     │
+   UDP ───▶ │ DNS server    ·  protocol translate │
+  Unix ───▶ │ TLS terminate ·  sendfile(2)        │
             │                                     │
             └─────────────────────────────────────┘
 ```
