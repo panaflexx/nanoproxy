@@ -33,7 +33,8 @@
     "access_log": "stdout", // "stdout" (default), "stderr", "off", or a file path
     "config": "warn",
     "server": "warn",
-    "proxy": "warn"
+    "proxy": "warn",
+	"static": "warn"
   },
 
   "dns_ttl": 300,

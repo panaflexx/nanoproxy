@@ -4,7 +4,19 @@ project(npserver_project C)
 #Set C standard if needed (optional)
 set(CMAKE_C_STANDARD 11)
 #Define the executable
-add_executable(npserver server.c)
+add_executable(npserver
+    server.c
+    include/config.h
+    include/dict.h
+    include/dns.h
+    include/http.h
+    include/logger.h
+    include/mock.h
+    include/request.h
+    include/socket_server.h
+    include/stb_ds.h
+    include/stringbuf.h
+)
 # includes
 target_include_directories(npserver PRIVATE
 	${CMAKE_SOURCE_DIR}/include

@@ -28,6 +28,40 @@
 #define MAX_HEADER_VALUE_SIZE 4096
 #define MAX_HEADER_LINE_SIZE 8192
 
+/* Safe min/max helpers */
+#ifndef MIN
+#  define MIN(a,b) ((a) < (b) ? (a) : (b))
+#endif
+#ifndef MAX
+#  define MAX(a,b) ((a) > (b) ? (a) : (b))
+#endif
+
+/* Bounded memcpy for future-proof safety on HTTP paths */
+#ifndef SAFE_MEMCPY
+#  define SAFE_MEMCPY(dst, src, n, dst_sz) do { \
+       size_t __n = (n); size_t __sz = (dst_sz); \
+       size_t __c = (__n < __sz) ? __n : __sz; \
+       memcpy((dst), (src), __c); \
+   } while(0)
+#endif
+
+/* Safe strncpy with guaranteed NUL termination */
+#ifndef SAFE_STRNCPY
+#  define SAFE_STRNCPY(dst, src, n, dst_sz) do { \
+       size_t __n = (n); size_t __sz = (dst_sz); \
+       size_t __c = (__n < __sz) ? __n : __sz - 1; \
+       strncpy((dst), (src), __c); (dst)[__c] = '\0'; \
+   } while(0)
+#endif
+
+/* Safe strtol wrapper: returns 0 on error, stores result via out param */
+#ifndef SAFE_STRTOL
+#  define SAFE_STRTOL(str, out, base) do { \
+       char *__end; errno = 0; long __v = strtol((str), &__end, (base)); \
+       *(out) = (errno == 0 && *__end == '\0') ? __v : 0; \
+   } while(0)
+#endif
+
 #ifdef HTTP_PARSE_DEBUG
 #  define PARSE_ERROR(msg) do { size_t __bl = stringbuf_size(&parser->buffer); LOG_ERROR(HTTP, "parse: %s (fd=%d pos=%zu buflen=%zu)", (msg), parser->fd, parser->pos, __bl); parser->state = HP_ERROR; return -1; } while(0)
 #else
@@ -72,7 +106,7 @@ enum http_parser_state {
 typedef struct http_parser {
     enum http_parser_state state;
     StringBuf buffer;
-    size_t pos;
+    ssize_t pos;
     struct http_request req;
     size_t content_length;
     bool chunked;
@@ -273,76 +307,88 @@ static inline int http_parser_feed(struct http_parser *parser, const char *data,
                     size_t avail = buflen - parser->pos;
                     if (avail == 0) return 0;
 
-                    size_t consume = (remaining < avail) ? remaining : avail;
-                    if (parser->req.body_len + consume > MAX_BODY_SIZE) {
-                        PARSE_ERROR("body exceeds MAX_BODY_SIZE");
-                    }
+	                    size_t consume = (remaining < avail) ? remaining : avail;
+	                    if (consume > MAX_BODY_SIZE || parser->req.body_len > MAX_BODY_SIZE - consume) {
+	                        PARSE_ERROR("body exceeds MAX_BODY_SIZE");
+	                    }
                     char *new_body = (char *)realloc(parser->req.body, parser->req.body_len + consume);
                     if (!new_body) {
                         PARSE_ERROR("realloc body failed");
                     }
                     parser->req.body = new_body;
-                    memcpy(parser->req.body + parser->req.body_len, buf + parser->pos, consume);
+                    SAFE_MEMCPY(parser->req.body + parser->req.body_len, buf + parser->pos, consume, consume);
                     parser->req.body_len += consume;
                     parser->pos += consume;
 
-                    if (parser->req.body_len == parser->content_length) {
-                        parser->state = HP_DONE;
-                    }
-                } else {
-                    // Basic chunked parsing (no extensions, trailers)
-                    while (parser->pos < buflen) {
-                        if (parser->content_length == 0) { // Parse chunk size
-                            ssize_t line_end_pos = stringbuf_memchr(&parser->buffer, '\n', parser->pos);
-                            if (line_end_pos == -1) return 0;
+	                    if (parser->req.body_len == parser->content_length) {
+	                        parser->state = HP_DONE;
+	                    }
+	                } else {
+	                    // Hardened chunked parsing (no extensions, trailers)
+	                    while (parser->pos < buflen) {
+	                        if (parser->content_length == 0) { // Parse chunk size
+	                            ssize_t line_end_pos = stringbuf_memchr(&parser->buffer, '\n', parser->pos);
+	                            if (line_end_pos == -1) return 0;
 
-                            size_t line_len = line_end_pos - parser->pos;
-                            if (line_end_pos > 0 && buf[line_end_pos - 1] == '\r') line_len--;
+	                            size_t line_len = line_end_pos - parser->pos;
+	                            if (line_end_pos > 0 && buf[line_end_pos - 1] == '\r') line_len--;
 
-                            char line[32];
-                            if (line_len >= sizeof(line)) {
-                                PARSE_ERROR("chunk-size line too long");
-                            }
-                            memcpy(line, buf + parser->pos, line_len);
-                            line[line_len] = '\0';
+	                            /* Reject lines that won't fit or are suspiciously long */
+	                            if (line_len == 0 || line_len >= 32) {
+	                                PARSE_ERROR("chunk-size line too long or empty");
+	                            }
 
-                            char *semi = strchr(line, ';');
-                            if (semi) *semi = '\0';
+	                            char line[32];
+	                            memcpy(line, buf + parser->pos, line_len);
+	                            line[line_len] = '\0';
 
-                            char *endptr;
-                            errno = 0;
-                            unsigned long long chunk_size = strtoull(line, &endptr, 16);
-                            if (errno == ERANGE || *endptr != '\0' || chunk_size > MAX_CHUNK_SIZE || parser->req.body_len + chunk_size > MAX_BODY_SIZE) {
-                                PARSE_ERROR("chunk size invalid or too large");
-                            }
-                            parser->content_length = (size_t)chunk_size;
+	                            /* Only accept hex digits before optional ;extension; ignore extensions per spec */
+	                            char *semi = strchr(line, ';');
+	                            if (semi) *semi = '\0';
+	                            for (char *p = line; *p; ++p) {
+	                                if (!isxdigit((unsigned char)*p)) {
+	                                    PARSE_ERROR("invalid hex in chunk size");
+	                                }
+	                            }
 
-                            if (parser->content_length == 0) {
-                                parser->state = HP_DONE;
-                                parser->pos = line_end_pos + 1;
-                                break;
-                            }
-                            parser->pos = line_end_pos + 1;
-                        } else { // Parse chunk data
-                            size_t avail = buflen - parser->pos;
-                            if (avail < parser->content_length + 2) return 0;
+	                            char *endptr;
+	                            errno = 0;
+	                            unsigned long long chunk_size = strtoull(line, &endptr, 16);
+	                            if (errno == ERANGE || *endptr != '\0' ||
+	                                chunk_size > MAX_CHUNK_SIZE ||
+	                                parser->req.body_len > MAX_BODY_SIZE - chunk_size) {
+	                                PARSE_ERROR("chunk size invalid or too large");
+	                            }
+	                            parser->content_length = (size_t)chunk_size;
 
-                            if (memcmp(buf + parser->pos + parser->content_length, "\r\n", 2) != 0) {
-                                PARSE_ERROR("missing CRLF after chunk data");
-                            }
+	                            if (parser->content_length == 0) {
+	                                parser->state = HP_DONE;
+	                                parser->pos = line_end_pos + 1;
+	                                break;
+	                            }
+	                            parser->pos = line_end_pos + 1;
+	                        } else { // Parse chunk data
+	                            size_t avail = buflen - parser->pos;
+	                            if (avail < parser->content_length + 2) return 0;
 
-                            char *new_body = (char *)realloc(parser->req.body, parser->req.body_len + parser->content_length);
-                            if (!new_body) {
-                                PARSE_ERROR("realloc chunk body failed");
-                            }
-                            parser->req.body = new_body;
-                            memcpy(parser->req.body + parser->req.body_len, buf + parser->pos, parser->content_length);
-                            parser->req.body_len += parser->content_length;
-                            parser->pos += parser->content_length + 2;
-                            parser->content_length = 0;
-                        }
-                    }
-                }
+	                            if (memcmp(buf + parser->pos + parser->content_length, "\r\n", 2) != 0) {
+	                                PARSE_ERROR("missing CRLF after chunk data");
+	                            }
+
+	                            /* Use MIN to safely bound the copy size */
+	                            size_t to_copy = MIN(parser->content_length, avail - 2);
+	                            char *new_body = (char *)realloc(parser->req.body, parser->req.body_len + to_copy);
+	                            if (!new_body) {
+	                                PARSE_ERROR("realloc chunk body failed");
+	                            }
+	                            parser->req.body = new_body;
+	                            SAFE_MEMCPY(parser->req.body + parser->req.body_len, buf + parser->pos, to_copy, to_copy);
+	                            parser->req.body_len += to_copy;
+	                            parser->pos += to_copy + 2;
+	                            parser->content_length = 0;
+	                        }
+	                    }
+	                }
                 // Shift remaining buffer data left if any
                 if (parser->pos > 0 && parser->pos < buflen) {
                     stringbuf_consume(&parser->buffer, parser->pos);
@@ -360,6 +406,13 @@ static inline int http_parser_feed(struct http_parser *parser, const char *data,
 }
 
 static inline size_t http_build_response(const struct http_response *resp, char *buf, size_t buf_size) {
+    /* Reject CR/LF in reason_phrase or header values to prevent response splitting */
+    if (resp->reason_phrase) {
+        for (const char *p = resp->reason_phrase; *p; ++p) {
+            if (*p == '\r' || *p == '\n') return 0;
+        }
+    }
+
     char status_line[64];
     snprintf(status_line, sizeof(status_line), "HTTP/1.1 %d %s\r\n", resp->status_code, resp->reason_phrase ? resp->reason_phrase : "");
     size_t len = strlen(status_line);
@@ -368,6 +421,10 @@ static inline size_t http_build_response(const struct http_response *resp, char 
 
     struct http_header *headers = resp->headers;
     for (ptrdiff_t i = 0; i < shlen(headers); ++i) {
+        /* Reject CR/LF in header values */
+        for (const char *p = headers[i].value; *p; ++p) {
+            if (*p == '\r' || *p == '\n') return 0;
+        }
         char header_line[512];
         size_t hlen = snprintf(header_line, sizeof(header_line), "%s: %s\r\n", headers[i].key, headers[i].value);
         if (len + hlen >= buf_size) return 0;
@@ -402,4 +459,3 @@ static inline bool http_should_keep_alive(struct http_request *req) {
 }
 
 #endif // HTTP_PARSER_H
-

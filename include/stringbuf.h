@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <ctype.h>
 #include <limits.h>
+#include <errno.h>
 
 /* Default max size if user passes 0 or huge value */
 #ifndef STRINGBUF_DEFAULT_CAP
@@ -38,12 +39,18 @@ bool stringbuf_appendf(StringBuf* sb, const char* fmt, ...);
 int stringbuf_vsscanf(const StringBuf* sb, const char* fmt, va_list ap);
 int stringbuf_sscanf(const StringBuf* sb, const char* fmt, ...);
 void stringbuf_clear(StringBuf* sb);
-void stringbuf_consume(StringBuf* sb, size_t n);
+void stringbuf_consume(StringBuf* sb, ssize_t n);
 char* stringbuf_strndup(const StringBuf* sb, size_t start, size_t n);
 ssize_t stringbuf_find(const StringBuf* sb, size_t start, const char* needle, size_t needle_len);
 ssize_t stringbuf_memchr(const StringBuf* sb, char c, size_t start);
 size_t stringbuf_trim_left(const StringBuf* sb, size_t start);
 size_t stringbuf_trim_right(const StringBuf* sb, size_t end);
+
+/* New: safe non-owning view + fast numeric parse + cheap predicates for small-string heavy code */
+bool stringbuf_init_view(StringBuf* sb, const char* src, size_t srclen);
+long long stringbuf_parse_ll(const StringBuf* sb, int* consumed);
+unsigned long long stringbuf_parse_ull(const StringBuf* sb, int* consumed);
+bool stringbuf_parse_ll_strict(const StringBuf* sb, long long* out);
 
 /* Accessors */
 static inline char* stringbuf_data(StringBuf* sb) { return sb ? sb->data : NULL; }
@@ -196,10 +203,10 @@ void stringbuf_clear(StringBuf* sb)
     }
 }
 
-void stringbuf_consume(StringBuf* sb, size_t n)
+void stringbuf_consume(StringBuf* sb, ssize_t n)
 {
-    if (!sb || !sb->data) return;
-    if (n > (size_t)sb->size) n = sb->size;
+    if (!sb || !sb->data || n <= 0) return;
+    if (n > sb->size) n = sb->size;
     memmove(sb->data, sb->data + n, sb->size - n);
     sb->size -= n;
     sb->data[sb->size] = '\0';
@@ -250,6 +257,54 @@ size_t stringbuf_trim_right(const StringBuf* sb, size_t end)
     if (!sb || !sb->data) return end;
     while (end > 0 && isspace((unsigned char)sb->data[end - 1])) --end;
     return end;
+}
+
+/* Implementation of the new helpers */
+
+bool stringbuf_init_view(StringBuf* sb, const char* src, size_t srclen)
+{
+    if (!sb) return false;
+    sb->data = (char*)src;
+    sb->size = (ssize_t)srclen;
+    sb->capacity = (ssize_t)srclen;
+    sb->owned = false;
+    return true;
+}
+
+long long stringbuf_parse_ll(const StringBuf* sb, int* consumed)
+{
+    if (!sb || !sb->data || sb->size == 0) {
+        if (consumed) *consumed = 0;
+        return 0;
+    }
+    char* end = NULL;
+    long long v = strtoll(sb->data, &end, 10);
+    if (consumed) *consumed = end ? (int)(end - sb->data) : 0;
+    return v;
+}
+
+unsigned long long stringbuf_parse_ull(const StringBuf* sb, int* consumed)
+{
+    if (!sb || !sb->data || sb->size == 0) {
+        if (consumed) *consumed = 0;
+        return 0;
+    }
+    char* end = NULL;
+    unsigned long long v = strtoull(sb->data, &end, 10);
+    if (consumed) *consumed = end ? (int)(end - sb->data) : 0;
+    return v;
+}
+
+bool stringbuf_parse_ll_strict(const StringBuf* sb, long long* out)
+{
+    if (!sb || !sb->data || sb->size == 0 || !out) return false;
+    char* end = NULL;
+    errno = 0;
+    long long v = strtoll(sb->data, &end, 10);
+    if (errno == ERANGE || end == sb->data || *end != '\0')
+        return false;
+    *out = v;
+    return true;
 }
 
 #endif /* STRINGBUF_IMPLEMENTATION */

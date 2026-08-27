@@ -99,16 +99,14 @@ int main(int argc, char *argv[]) {
                     if (rlen >= 3 && strcmp(raw_prefix + rlen - 3, "/**") == 0) {
                         // /api/** -> /api/
                         size_t plen = rlen - 2; /* drop the final '**' */
-                        memcpy(prefix_buf, raw_prefix, plen);
-                        prefix_buf[plen] = '\0';
-                        if (plen == 0 || prefix_buf[plen-1] != '/') strcat(prefix_buf, "/");
+                        SAFE_STRNCPY(prefix_buf, raw_prefix, plen, sizeof(prefix_buf));
+                        if (plen == 0 || prefix_buf[plen-1] != '/') SAFE_STRNCPY(prefix_buf + plen, "/", 1, sizeof(prefix_buf) - plen);
                         prefix = prefix_buf;
                     } else if (strcmp(raw_prefix + rlen - 2, "/*") == 0) {
                         // /api/* -> /api/
                         size_t plen = rlen - 1; /* drop the final '*' */
-                        memcpy(prefix_buf, raw_prefix, plen);
-                        prefix_buf[plen] = '\0';
-                        if (plen == 0 || prefix_buf[plen-1] != '/') strcat(prefix_buf, "/");
+                        SAFE_STRNCPY(prefix_buf, raw_prefix, plen, sizeof(prefix_buf));
+                        if (plen == 0 || prefix_buf[plen-1] != '/') SAFE_STRNCPY(prefix_buf + plen, "/", 1, sizeof(prefix_buf) - plen);
                         prefix = prefix_buf;
                     }
                 }
@@ -213,7 +211,8 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "-c") == 0) {
             i++;
             if (i < argc) {
-                default_backlog = atoi(argv[i]);
+                long __b; SAFE_STRTOL(argv[i], &__b, 10);
+                default_backlog = (__b > 0 && __b <= 10000) ? (int)__b : 128;
             }
             i++;
             continue;
